@@ -1,0 +1,72 @@
+name: release
+on:
+  push:
+    branches: [main]
+    paths:
+      - "android/**"
+      - "android-tsgo/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+jobs:
+  publish-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
+
+      # Native libs (jniLibs, tsgo.aar) are prebuilt and committed to the repo — see
+      # scripts/build-*.sh — so this job never needs the NDK, same as ci.yml's debug build.
+      - name: Write signing keystore
+        run: |
+          mkdir -p android/keystore
+          echo "${{ secrets.ANDROID_KEYSTORE_BASE64 }}" | base64 -d > android/keystore/upload-keystore.jks
+          cat > android/keystore.properties <<EOF
+          storeFile=keystore/upload-keystore.jks
+          storePassword=${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          keyAlias=${{ secrets.ANDROID_KEY_ALIAS }}
+          keyPassword=${{ secrets.ANDROID_KEY_PASSWORD }}
+          EOF
+
+      - run: cd android && ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Read version
+        id: version
+        run: |
+          NAME=$(grep -m1 'versionName = ' android/app/build.gradle.kts | sed -E 's/.*"(.*)".*/\1/')
+          CODE=$(grep -m1 'versionCode = ' android/app/build.gradle.kts | sed -E 's/[^0-9]*([0-9]+).*/\1/')
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+
+      - uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      # upload-cloud-storage treats `destination` as a FOLDER when `path` is a single file —
+      # it uploads to destination/<basename of path>, not to destination itself. Renaming the
+      # file locally first is the only way to get an exact, flat object name at the URL the
+      # README/admin page actually link to.
+      - name: Prepare upload filenames
+        run: |
+          mkdir -p /tmp/release-apk
+          cp android/app/build/outputs/apk/release/app-release.apk \
+            /tmp/release-apk/sufficit-mobile-ai-models-latest.apk
+          cp android/app/build/outputs/apk/release/app-release.apk \
+            "/tmp/release-apk/sufficit-mobile-ai-models-v${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}.apk"
+
+      - uses: google-github-actions/upload-cloud-storage@v2
+        with:
+          path: /tmp/release-apk/sufficit-mobile-ai-models-latest.apk
+          destination: suff-public/sufficit-mobile-ai-models
+          parent: false
+
+      - uses: google-github-actions/upload-cloud-storage@v2
+        with:
+          path: "/tmp/release-apk/sufficit-mobile-ai-models-v${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}.apk"
+          destination: suff-public/sufficit-mobile-ai-models/releases
+          parent: false

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Allows plain HTTP only to the loopback interface, where llama-server/whisper-server bind
+    (see LlamaServerManager/WhisperServerManager — never on 0.0.0.0, never past the tailnet's own
+    TLS termination). Everything else keeps the platform default (cleartext blocked, targetSdk 28+).
+
+    Found on-device: with no config at all, every OkHttp call this app makes to 127.0.0.1 threw
+    UnknownServiceException ("CLEARTEXT communication to 127.0.0.1 not permitted") from day one —
+    silently, since ModelRuntimeService's health-check loop swallowed the exception into a plain
+    `false`. That made the 3-strike keep-alive (PLAN T3.1) restart-loop both native servers every
+    ~90s forever, since a health probe could never succeed. This was mistaken for a memory/thermal
+    problem before the actual exception was logged and caught here.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+        <domain includeSubdomains="false">localhost</domain>
+    </domain-config>
+</network-security-config>

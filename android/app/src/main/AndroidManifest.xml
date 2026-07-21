@@ -1,0 +1,96 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Sufficit Transcription IPC contract v1 (aidl/com/sufficit/ipc/transcription/,
+         docs/ipc-transcription-contract.md). Normal protection level, not signature: this app
+         has a real release keystore but consumer apps (e.g. sufficit-android-ai-gateway) may
+         not yet, so a signature check would break cross-app calls outside matching debug
+         keystores. Declaring the permission here is what lets TranscriptionIpcService require
+         it below; a caller must declare the matching <uses-permission>. -->
+    <permission
+        android:name="com.sufficit.ipc.transcription.permission.PROVIDE_TRANSCRIPTION"
+        android:protectionLevel="normal" />
+
+    <application
+        android:allowBackup="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="Sufficit Mobile AI Models"
+        android:supportsRtl="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:theme="@style/Theme.SufficitMobileAI">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:theme="@style/Theme.SufficitMobileAI.Splash">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Own process: a crash anywhere in the UI (an Activity/Compose bug) must not be able
+             to take the self-announce/tailnet heartbeat down with it either. -->
+        <service
+            android:name=".SyncForegroundService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":sync"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Always-on on-device AI inference provider reachable over a private tailnet; must outlive 6h dataSync limits to keep serving embeddings." />
+        </service>
+
+        <!-- Separate process: a crash while loading/running a model (native subprocess,
+             large-allocation OOM, download failure) must never take the self-announce/tailnet
+             heartbeat above down with it — "a execução/download de um modelo não pode derrubar
+             o serviço de api, devem ser processos diferentes". -->
+        <service
+            android:name=".ModelRuntimeService"
+            android:enabled="true"
+            android:exported="false"
+            android:process=":modelruntime"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Always-on on-device AI inference provider reachable over a private tailnet; must outlive 6h dataSync limits to keep serving embeddings." />
+        </service>
+
+        <!-- Sufficit Transcription IPC contract v1 — see the <permission> declaration above and
+             docs/ipc-transcription-contract.md. Same :modelruntime process as
+             ModelRuntimeService/WhisperServerManager so it can read their state in-process; a
+             plain bound service (no startForeground), so it carries none of their
+             foregroundServiceType/specialUse requirements. -->
+        <service
+            android:name=".TranscriptionIpcService"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="com.sufficit.ipc.transcription.permission.PROVIDE_TRANSCRIPTION"
+            android:process=":modelruntime">
+            <intent-filter>
+                <action android:name="com.sufficit.ipc.transcription.ACTION_BIND_TRANSCRIPTION_SERVICE" />
+            </intent-filter>
+        </service>
+
+        <receiver
+            android:name=".BootCompletedReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>

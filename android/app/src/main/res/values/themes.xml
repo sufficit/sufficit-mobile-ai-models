@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.SufficitMobileAI" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/sufficit_canvas</item>
+    </style>
+
+    <style name="Theme.SufficitMobileAI.Splash" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/sufficit_surface</item>
+        <!-- ic_launcher_foreground (not the old flat ic_launcher.png): pre-padded to the
+             adaptive-icon safe zone so the SplashScreen API's own icon frame doesn't crop or
+             stretch it — the old raw drawable filled almost its entire canvas edge to edge,
+             which the OS's masking then visibly distorted. -->
+        <item name="windowSplashScreenAnimatedIcon">@drawable/ic_launcher_foreground</item>
+        <item name="postSplashScreenTheme">@style/Theme.SufficitMobileAI</item>
+    </style>
+</resources>

@@ -1,0 +1,19 @@
+.gradle/
+.kotlin/
+.idea/
+.tools/
+build/
+local.properties
+*.iml
+app/build/
+captures/
+.DS_Store
+**/.cxx/
+**/tmp/
+app/.cxx/
+
+# secrets-and-tokens (never commit real credentials)
+*.token
+*.keystore
+*.jks
+keystore.properties

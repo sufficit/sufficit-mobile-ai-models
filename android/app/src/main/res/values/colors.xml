@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Mirrors sufficit-blazor/src/wwwroot/assets/scss/_tokens.scss (source of truth) -->
+    <color name="sufficit_amber">#EE6321</color>
+    <color name="sufficit_ink">#1F2226</color>
+    <color name="sufficit_canvas">#F7F8FA</color>
+    <color name="sufficit_surface">#FFFFFF</color>
+    <color name="sufficit_canvas_dark">#15171A</color>
+    <color name="sufficit_surface_dark">#1F2226</color>
+</resources>

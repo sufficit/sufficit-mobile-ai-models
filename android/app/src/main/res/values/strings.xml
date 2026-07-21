@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Sufficit Mobile AI Models</string>
+
+    <!-- Shared -->
+    <string name="action_back">Voltar</string>
+    <string name="notification_starting">Iniciando…</string>
+
+    <!-- LoginScreen -->
+    <string name="login_title">Sufficit Mobile AI Models</string>
+    <string name="login_subtitle">Transforme este aparelho em um provedor de IA da Sufficit.</string>
+    <string name="login_button">Entrar com Sufficit</string>
+    <string name="login_use_token">Usar token de pareamento</string>
+    <string name="login_cancelled">Login cancelado.</string>
+    <string name="login_failed">Falha no login: %1$s</string>
+    <string name="login_start_failed">Falha ao iniciar login: %1$s</string>
+
+    <!-- TokenPairingScreen -->
+    <string name="token_pairing_title">Parear com token</string>
+    <string name="token_pairing_subtitle">Cole o token gerado em /ai/mobile-devices. Uso avançado — prefira \"Entrar com Sufficit\" na tela anterior quando possível.</string>
+    <string name="token_pairing_label">Pairing token</string>
+    <string name="token_pairing_button">Parear com token</string>
+
+    <!-- HomeScreen -->
+    <string name="home_account_sufficit">Conta Sufficit</string>
+    <string name="home_paired_by_token">Pareado por token</string>
+    <string name="action_settings">Configurações</string>
+    <string name="home_device_card_title">Dispositivo</string>
+    <string name="home_status_operational">Operacional</string>
+    <string name="home_status_model_only">Modelo ativo, aguardando sincronização</string>
+    <string name="home_status_sync_only">Sincronizado, modelo parado</string>
+    <string name="home_status_waiting">Aguardando</string>
+    <string name="home_network_address_label">Endereço de rede</string>
+    <string name="home_network_address_placeholder">Definido automaticamente pelo servidor (em breve)</string>
+    <string name="home_sync_now">Sincronizar agora</string>
+    <string name="home_last_sync">Última sincronização: %1$s</string>
+    <string name="home_model_card_title">Modelo de IA</string>
+    <string name="home_no_model_selected">Nenhum modelo selecionado.</string>
+    <string name="home_model_running_suffix"> · rodando</string>
+    <string name="home_model_stopped_suffix"> · parado</string>
+    <string name="home_manage_models">Gerenciar modelos</string>
+
+    <!-- SettingsScreen -->
+    <string name="settings_title">Configurações</string>
+    <string name="settings_paired_via">Pareado via: %1$s</string>
+    <string name="settings_pairing_mode_token">Token de pareamento</string>
+    <string name="settings_logout">Sair</string>
+
+    <!-- ModelsScreen -->
+    <string name="models_title">Modelos de IA</string>
+    <string name="models_recommended_title">Recomendado para este aparelho</string>
+    <string name="models_recommended_subtitle">Testados neste modelo de celular (Galaxy A51 / Exynos 9611) — os demais resultados de busca abaixo não têm compatibilidade garantida.</string>
+    <string name="models_recommended_specs">%1$d dimensões · ~%2$s GB</string>
+    <string name="models_already_installed">Já instalado</string>
+    <string name="models_download">Baixar</string>
+    <string name="models_installed_title">Instalados</string>
+    <string name="models_none_installed">Nenhum modelo baixado ainda.</string>
+    <string name="models_search_title">Buscar no Hugging Face</string>
+    <string name="models_search_label">Buscar (ex: embedding gguf)</string>
+    <string name="action_search">Buscar</string>
+    <string name="models_active">Ativo</string>
+    <string name="models_remove">Remover</string>
+    <string name="models_test_ok">Teste OK: %1$d dimensões, %2$dms</string>
+    <string name="models_test_failed">Teste falhou: %1$s</string>
+    <string name="models_use_this_model">Usar este modelo</string>
+    <string name="models_test">Testar</string>
+    <string name="models_test_api">Testar API</string>
+    <string name="models_test_api_restarts_server">Testar API (reinicia o servidor)</string>
+    <string name="models_search_downloads">%1$d downloads</string>
+    <string name="models_close">Fechar</string>
+    <string name="models_view_files">Ver arquivos</string>
+    <string name="models_no_gguf_files">Nenhum arquivo .gguf encontrado.</string>
+    <string name="models_delete_confirm_title">Remover modelo?</string>
+    <string name="models_delete_confirm_body_active">\"%1$s\" é o modelo ATIVO — removê-lo para o servidor de inferência. Baixar de novo custa ~1GB.</string>
+    <string name="models_delete_confirm_body">Remover \"%1$s\"? Baixar de novo custa ~1GB.</string>
+    <string name="models_delete_confirm_action">Remover</string>
+    <string name="models_delete_cancel_action">Cancelar</string>
+    <string name="models_generic_fallback">modelo</string>
+    <string name="models_transcription_title">Transcrição (Whisper)</string>
+    <string name="models_transcription_subtitle">Modelos de fala-para-texto (whisper.cpp) — mesma API do dispositivo, processo separado do embedding.</string>
+    <string name="models_size_only_spec">~%1$s GB</string>
+    <string name="models_test_transcription_ok">Teste OK: \"%1$s\" (%2$dms)</string>
+    <string name="models_download_failed">Falha no download: %1$s</string>
+    <string name="models_unknown_error">erro desconhecido</string>
+    <string name="models_search_failed">falha na busca</string>
+    <string name="models_list_files_failed">falha ao listar arquivos</string>
+    <string name="models_transcription_active_notification">Transcrição: %1$s</string>
+    <string name="models_transcription_stopped_notification">Transcrição parada</string>
+
+    <!-- SyncForegroundService -->
+    <string name="sync_notification_channel_description">Mantém o dispositivo sincronizado como provedor de IA da Sufficit.</string>
+    <string name="sync_notification_title">Sufficit Mobile AI Models — Sincronização</string>
+    <string name="sync_success">Sincronizado</string>
+    <string name="sync_failure">Falha na sincronização: %1$s</string>
+    <string name="sync_no_response">Sem resposta do serviço de sincronização.</string>
+
+    <!-- ModelRuntimeService -->
+    <string name="modelruntime_notification_channel_description">Mantém o modelo de IA deste dispositivo carregado e pronto.</string>
+    <string name="models_waiting_wifi">Aguardando WiFi para baixar o modelo recomendado</string>
+    <string name="models_downloading_progress">Baixando modelo — %1$d%%</string>
+    <string name="models_download_failed_notification">Falha ao baixar modelo: %1$s</string>
+    <string name="models_active_notification">Ativo: %1$s</string>
+    <string name="models_none_active_notification">Nenhum modelo ativo</string>
+    <string name="models_thermal_paused">Pausado: aparelho quente demais (proteção térmica)</string>
+</resources>
