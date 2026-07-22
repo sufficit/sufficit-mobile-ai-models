@@ -85,6 +85,18 @@ class ModelRuntimeService : Service() {
     // that matches the original default (embedding auto-provisions, transcription doesn't).
     @Volatile
     private var activeEngineKind: ModelKind = ModelKind.EMBEDDING
+    // Set for the duration of handleTestLocal/handleTestApi — found on-device: without this,
+    // the keep-alive loop's own tick (running independently on [scope], every LOOP_INTERVAL_MS)
+    // sees the engine a test just deactivated as "activeEngineKind isn't running" and restarts +
+    // broadcasts it right back, racing the test's own switch/broadcast. For handleTestApi this is
+    // not just a wasted reload: both broadcasts land in :sync independently (embedding load and
+    // transcription load are handled as separate steps in the same receiver, see
+    // SyncForegroundService kdoc), so :sync can end up holding BOTH a ~1GB embedding model and a
+    // freshly-loading whisper model at once — confirmed on-device, killed the process outright
+    // (ActivityManager: "...crashed service...for mem-pressure-event") on a phone with exactly the
+    // RAM headroom this app's own mutual-exclusion design exists to protect (see class kdoc).
+    @Volatile
+    private var testInProgress = false
 
     override fun onCreate() {
         super.onCreate()
@@ -177,6 +189,13 @@ class ModelRuntimeService : Service() {
         if (loopJob?.isActive == true) return
         loopJob = scope.launch {
             while (isActive) {
+                if (testInProgress) {
+                    // A handleTestLocal/handleTestApi run owns the resident slot right now —
+                    // see testInProgress's own kdoc for why this tick must not touch it.
+                    delay(LOOP_INTERVAL_MS)
+                    continue
+                }
+
                 if (isThermallySevere()) {
                     var anyStopped = false
                     for (kind in ModelKind.entries) {
@@ -279,39 +298,44 @@ class ModelRuntimeService : Service() {
      * kind in :sync. [restoreActiveEngine] brings back whatever was actually supposed to be
      * running once the test completes. */
     private suspend fun handleTestLocal(kind: ModelKind, fileName: String) {
-        val file = File(ModelsDir(applicationContext), fileName)
-        for (k in ModelKind.entries) {
-            val m = managerFor(k)
-            if (m.isRunning()) m.stop()
-        }
-
-        val intent = Intent(ACTION_TEST_RESULT).setPackage(packageName)
-            .putExtra(EXTRA_MODEL_KIND, kind.name)
-            .putExtra(EXTRA_FILE_NAME, fileName)
-        when (kind) {
-            ModelKind.EMBEDDING -> when (val result = ModelTesters.embeddingCli.test(applicationContext, file)) {
-                is EmbeddingTestResult.Success -> intent
-                    .putExtra(EXTRA_SUCCESS, true)
-                    .putExtra(EXTRA_DIMENSIONS, result.dimensions)
-                    .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
-                is EmbeddingTestResult.Failure -> intent
-                    .putExtra(EXTRA_SUCCESS, false)
-                    .putExtra(EXTRA_ERROR, result.message)
+        testInProgress = true
+        try {
+            val file = File(ModelsDir(applicationContext), fileName)
+            for (k in ModelKind.entries) {
+                val m = managerFor(k)
+                if (m.isRunning()) m.stop()
             }
-            ModelKind.TRANSCRIPTION -> when (val result = ModelTesters.transcriptionCli.test(applicationContext, file)) {
-                is TranscriptionTestResult.Success -> intent
-                    .putExtra(EXTRA_SUCCESS, true)
-                    .putExtra(EXTRA_TRANSCRIPTION_TEXT, result.text)
-                    .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
-                is TranscriptionTestResult.Failure -> intent
-                    .putExtra(EXTRA_SUCCESS, false)
-                    .putExtra(EXTRA_ERROR, result.message)
-            }
-        }
-        sendBroadcast(intent)
 
-        restoreActiveEngine()
-        broadcastStatus()
+            val intent = Intent(ACTION_TEST_RESULT).setPackage(packageName)
+                .putExtra(EXTRA_MODEL_KIND, kind.name)
+                .putExtra(EXTRA_FILE_NAME, fileName)
+            when (kind) {
+                ModelKind.EMBEDDING -> when (val result = ModelTesters.embeddingCli.test(applicationContext, file)) {
+                    is EmbeddingTestResult.Success -> intent
+                        .putExtra(EXTRA_SUCCESS, true)
+                        .putExtra(EXTRA_DIMENSIONS, result.dimensions)
+                        .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
+                    is EmbeddingTestResult.Failure -> intent
+                        .putExtra(EXTRA_SUCCESS, false)
+                        .putExtra(EXTRA_ERROR, result.message)
+                }
+                ModelKind.TRANSCRIPTION -> when (val result = ModelTesters.transcriptionCli.test(applicationContext, file)) {
+                    is TranscriptionTestResult.Success -> intent
+                        .putExtra(EXTRA_SUCCESS, true)
+                        .putExtra(EXTRA_TRANSCRIPTION_TEXT, result.text)
+                        .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
+                    is TranscriptionTestResult.Failure -> intent
+                        .putExtra(EXTRA_SUCCESS, false)
+                        .putExtra(EXTRA_ERROR, result.message)
+                }
+            }
+            sendBroadcast(intent)
+
+            restoreActiveEngine()
+            broadcastStatus()
+        } finally {
+            testInProgress = false
+        }
     }
 
     /** Full-pipeline test — switches [kind] to run [fileName] as the actual resident HTTP
@@ -319,58 +343,64 @@ class ModelRuntimeService : Service() {
      * like a real caller would. Complements [handleTestLocal]: that one proves the model
      * works, this one proves the server + API layer work too. */
     private suspend fun handleTestApi(kind: ModelKind, fileName: String) {
-        val file = File(ModelsDir(applicationContext), fileName)
-        val manager = managerFor(kind)
-        // Already the one resident engine, running exactly this file? Test it in place. Anything
-        // else (different kind, or a different model of the currently-resident kind) has to
-        // borrow the single resident slot for the duration of the test — mutual exclusion means
-        // there's nowhere else for it to run (see class kdoc).
-        val alreadyCorrect = kind == activeEngineKind &&
-            fileName == registry.activeModelFileName(kind) &&
-            manager.isRunning()
+        testInProgress = true
+        try {
+            val file = File(ModelsDir(applicationContext), fileName)
+            val manager = managerFor(kind)
+            // Already the one resident engine, running exactly this file? Test it in place.
+            // Anything else (different kind, or a different model of the currently-resident
+            // kind) has to borrow the single resident slot for the duration of the test —
+            // mutual exclusion means there's nowhere else for it to run (see class kdoc).
+            val alreadyCorrect = kind == activeEngineKind &&
+                fileName == registry.activeModelFileName(kind) &&
+                manager.isRunning()
 
-        if (!alreadyCorrect) {
-            deactivateOtherEngines(kind)
-            manager.switchTo(applicationContext, file)
-            // switchTo only updates this process's (:modelruntime) intent — the HTTP test below
-            // hits :sync's real loopback listener, which only loads a model in response to this
-            // broadcast (see NativeEmbeddingManager/NativeTranscriptionManager kdoc). Without
-            // this, the test polls a :sync that was never told to load anything and always times
-            // out with "modelo não ficou pronto a tempo" — invisible for embedding as long as
-            // it's already the resident engine from normal auto-provisioning, but always hit for
-            // transcription (never auto-provisioned, essentially never already resident).
+            if (!alreadyCorrect) {
+                deactivateOtherEngines(kind)
+                manager.switchTo(applicationContext, file)
+                // switchTo only updates this process's (:modelruntime) intent — the HTTP test
+                // below hits :sync's real loopback listener, which only loads a model in
+                // response to this broadcast (see NativeEmbeddingManager/
+                // NativeTranscriptionManager kdoc). Without this, the test polls a :sync that
+                // was never told to load anything and always times out with "modelo não ficou
+                // pronto a tempo" — invisible for embedding as long as it's already the resident
+                // engine from normal auto-provisioning, but always hit for transcription (never
+                // auto-provisioned, essentially never already resident).
+                broadcastStatus()
+            }
+
+            val intent = Intent(ACTION_TEST_RESULT).setPackage(packageName)
+                .putExtra(EXTRA_MODEL_KIND, kind.name)
+                .putExtra(EXTRA_FILE_NAME, fileName)
+            when (kind) {
+                ModelKind.EMBEDDING -> when (val result = ModelTesters.embedding.test(manager.port)) {
+                    is EmbeddingTestResult.Success -> intent
+                        .putExtra(EXTRA_SUCCESS, true)
+                        .putExtra(EXTRA_DIMENSIONS, result.dimensions)
+                        .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
+                    is EmbeddingTestResult.Failure -> intent
+                        .putExtra(EXTRA_SUCCESS, false)
+                        .putExtra(EXTRA_ERROR, result.message)
+                }
+                ModelKind.TRANSCRIPTION -> when (val result = ModelTesters.transcription.test(manager.port)) {
+                    is TranscriptionTestResult.Success -> intent
+                        .putExtra(EXTRA_SUCCESS, true)
+                        .putExtra(EXTRA_TRANSCRIPTION_TEXT, result.text)
+                        .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
+                    is TranscriptionTestResult.Failure -> intent
+                        .putExtra(EXTRA_SUCCESS, false)
+                        .putExtra(EXTRA_ERROR, result.message)
+                }
+            }
+            sendBroadcast(intent)
+
+            // Restore whatever is actually supposed to be running — testing a different
+            // engine/model must never leave the resident slot stuck on it.
+            if (!alreadyCorrect) restoreActiveEngine()
             broadcastStatus()
+        } finally {
+            testInProgress = false
         }
-
-        val intent = Intent(ACTION_TEST_RESULT).setPackage(packageName)
-            .putExtra(EXTRA_MODEL_KIND, kind.name)
-            .putExtra(EXTRA_FILE_NAME, fileName)
-        when (kind) {
-            ModelKind.EMBEDDING -> when (val result = ModelTesters.embedding.test(manager.port)) {
-                is EmbeddingTestResult.Success -> intent
-                    .putExtra(EXTRA_SUCCESS, true)
-                    .putExtra(EXTRA_DIMENSIONS, result.dimensions)
-                    .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
-                is EmbeddingTestResult.Failure -> intent
-                    .putExtra(EXTRA_SUCCESS, false)
-                    .putExtra(EXTRA_ERROR, result.message)
-            }
-            ModelKind.TRANSCRIPTION -> when (val result = ModelTesters.transcription.test(manager.port)) {
-                is TranscriptionTestResult.Success -> intent
-                    .putExtra(EXTRA_SUCCESS, true)
-                    .putExtra(EXTRA_TRANSCRIPTION_TEXT, result.text)
-                    .putExtra(EXTRA_LATENCY_MS, result.latencyMs)
-                is TranscriptionTestResult.Failure -> intent
-                    .putExtra(EXTRA_SUCCESS, false)
-                    .putExtra(EXTRA_ERROR, result.message)
-            }
-        }
-        sendBroadcast(intent)
-
-        // Restore whatever is actually supposed to be running — testing a different
-        // engine/model must never leave the resident slot stuck on it.
-        if (!alreadyCorrect) restoreActiveEngine()
-        broadcastStatus()
     }
 
     /** Downloads any model chosen from ModelsScreen's Hugging Face search or recommended list —

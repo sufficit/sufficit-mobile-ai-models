@@ -134,9 +134,15 @@ func unloadEmbeddingModelLocked() {
 	embeddingModelPath = ""
 }
 
-// isEmbeddingModelLoaded reports whether any model is currently resident.
+// isEmbeddingModelLoaded reports whether any model is currently resident. Uses TryLock, not
+// Lock — same reasoning as transcription.go's isTranscriptionModelLoaded: this is the HTTP
+// handler's readiness precheck, and loadEmbeddingModel holds embeddingMu for its entire
+// (multi-second, for a ~1GB model) load duration. A blocking Lock here would make the precheck
+// itself block for that whole load instead of answering "not ready yet" immediately.
 func isEmbeddingModelLoaded() bool {
-	embeddingMu.Lock()
+	if !embeddingMu.TryLock() {
+		return false
+	}
 	defer embeddingMu.Unlock()
 	return embeddingCtx != nil
 }

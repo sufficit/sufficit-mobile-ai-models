@@ -108,9 +108,20 @@ func unloadTranscriptionModelLocked() {
 	transcriptionModelPath = ""
 }
 
-// isTranscriptionModelLoaded reports whether any model is currently resident.
+// isTranscriptionModelLoaded reports whether any model is currently resident. Uses TryLock, not
+// Lock: this is called from the HTTP handler's readiness precheck (see newAudioHandler), and
+// loadTranscriptionModel holds transcriptionMu for its ENTIRE duration — whisper_init_from_file
+// on a real model file takes real wall time (confirmed on-device: ~25s for a small model). A
+// blocking Lock here would make the precheck itself block for that whole load instead of
+// answering "not ready yet" immediately, which is what actually breaks LocalTranscriptionTester's
+// poll-until-ready loop: OkHttp's client-level read timeout can then fire mid-load instead of the
+// loop getting a fast 503 to retry on. Held-lock (busy loading, or a transcribe() call already in
+// flight) reports "not loaded" — correct for the former, an acceptable narrow race for the
+// latter (mutual exclusion already limits this app to one inference at a time anyway).
 func isTranscriptionModelLoaded() bool {
-	transcriptionMu.Lock()
+	if !transcriptionMu.TryLock() {
+		return false
+	}
 	defer transcriptionMu.Unlock()
 	return transcriptionCtx != nil
 }
