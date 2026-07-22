@@ -10,6 +10,8 @@ on:
 jobs:
   publish-apk:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,3 +72,14 @@ jobs:
           path: "/tmp/release-apk/sufficit-mobile-ai-models-v${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}.apk"
           destination: suff-public/sufficit-mobile-ai-models/releases
           parent: false
+
+      # Repo went public — a real GitHub Release (Assets tab, changelog, "Latest" badge) works
+      # now and is more discoverable than the GCS link alone. Tag is versionName+versionCode so
+      # re-running this workflow without a version bump (e.g. workflow_dispatch) updates the
+      # existing release for that version instead of failing on a duplicate tag.
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}
+          name: v${{ steps.version.outputs.name }} (${{ steps.version.outputs.code }})
+          files: "/tmp/release-apk/sufficit-mobile-ai-models-v${{ steps.version.outputs.name }}-${{ steps.version.outputs.code }}.apk"
+          make_latest: true

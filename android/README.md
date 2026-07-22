@@ -176,24 +176,30 @@ tailnet nem faz nada. Então listar publicamente não expõe a tailnet a mais ri
 
 ## Download direto (fora da Play Store)
 
-Repo fica privado — GitHub não permite Release pública num repo privado (o asset exige auth
-com acesso ao repo, não dá pra linkar de fora). Distribuição direta do `.apk` é via bucket
-público do Google Cloud Storage, não pelo GitHub:
+Repo é público — distribuição direta do `.apk` em dois lugares, mesmo build assinado:
 
-- **Sempre a versão mais recente**: https://storage.googleapis.com/suff-public/sufficit-mobile-ai-models/sufficit-mobile-ai-models-latest.apk
-- Histórico por versão: `gs://suff-public/sufficit-mobile-ai-models/releases/sufficit-mobile-ai-models-v<versionName>-<versionCode>.apk`
+- **GitHub Releases** (recomendado, mais descobrível): https://github.com/sufficit/sufficit-mobile-ai-models/releases/latest
+- Bucket GCS (mantido por compatibilidade com links já distribuídos):
+  - **Sempre a versão mais recente**: https://storage.googleapis.com/suff-public/sufficit-mobile-ai-models/sufficit-mobile-ai-models-latest.apk
+  - Histórico por versão: `gs://suff-public/sufficit-mobile-ai-models/releases/sufficit-mobile-ai-models-v<versionName>-<versionCode>.apk`
 
 `.github/workflows/release.yml` builda e publica automaticamente a cada push em `main` que
 toca `android/**` ou `android-tsgo/**` (ou via `workflow_dispatch` manual). Usa a mesma upload
-key de `## Assinatura` acima — release assinado, não debug. Requer estes secrets no repo
-(`gh secret list`):
+key de `## Assinatura` acima — release assinado, não debug. Tag da release é
+`v<versionName>-<versionCode>` — rodar de novo sem bump de versão atualiza a release existente
+em vez de falhar em tag duplicada. Requer estes secrets no repo (`gh secret list`):
 
 - `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`,
   `ANDROID_KEY_PASSWORD` — já configurados (mesma upload key local).
 - `GCP_SA_KEY` — chave JSON de service account do projeto `voip-184717` com permissão de
   escrita no bucket `suff-public` (`Storage Object Admin` ou equivalente no path
-  `sufficit-mobile-ai-models/*`). **Ainda não configurado** — o job de upload falha até isso
-  ser adicionado.
+  `sufficit-mobile-ai-models/*`) — já configurado.
+- GitHub Release usa `GITHUB_TOKEN` automático do workflow (`permissions: contents: write`),
+  não precisa de secret extra.
+
+**IPA (iOS)**: não gerado ainda — não existe projeto iOS neste repo (fase 2, não iniciada).
+Precisa do port iOS (`gomobile bind -target=ios` + shell Swift), runner macOS no workflow, e
+certificado/provisioning da Apple (assinatura é obrigatória mesmo para distribuição ad-hoc).
 
 ## Fluxo de pareamento (hoje)
 
