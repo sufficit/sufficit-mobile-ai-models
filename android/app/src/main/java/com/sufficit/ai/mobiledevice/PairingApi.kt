@@ -87,9 +87,11 @@ class PairingApi(
     fun announce(
         gatewayBaseUrl: String,
         token: String,
-        deviceName: String
+        deviceName: String,
+        deviceModel: String,
+        appVersion: String
     ): AnnounceResult {
-        val body = announceBody(deviceName)
+        val body = announceBody(deviceName, deviceModel, appVersion)
         val url = gatewayBaseUrl.trimEnd('/') + "/mobile/$token/announce"
         val request = Request.Builder().url(url).post(body).build()
         return execute(request)
@@ -100,9 +102,11 @@ class PairingApi(
         accessToken: String,
         deviceInstanceId: String,
         deviceName: String,
+        deviceModel: String,
+        appVersion: String,
         contextId: String?
     ): AnnounceResult {
-        val body = announceBody(deviceName) {
+        val body = announceBody(deviceName, deviceModel, appVersion) {
             put("deviceInstanceId", deviceInstanceId)
             contextId?.let { put("contextId", it) }
         }
@@ -117,9 +121,13 @@ class PairingApi(
 
     private fun announceBody(
         deviceName: String,
+        deviceModel: String,
+        appVersion: String,
         extra: JSONObject.() -> Unit = {}
     ) = JSONObject().apply {
         put("deviceName", deviceName)
+        put("deviceModel", deviceModel)
+        put("appVersion", appVersion)
         extra()
     }.toString().toRequestBody("application/json".toMediaType())
 

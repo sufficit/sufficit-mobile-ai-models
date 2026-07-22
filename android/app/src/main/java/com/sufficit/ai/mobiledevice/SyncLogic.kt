@@ -28,6 +28,8 @@ suspend fun performSync(
     val pairingToken = store.pairingToken
     val accessToken = ensureFreshAccessToken(store, oauth)
     val deviceName = deviceDisplayName()
+    val deviceModel = deviceHardwareModel()
+    val appVersion = "${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})"
 
     val result = when {
         accessToken != null -> api.selfAnnounce(
@@ -35,12 +37,16 @@ suspend fun performSync(
             accessToken = accessToken,
             deviceInstanceId = store.deviceInstanceId,
             deviceName = deviceName,
+            deviceModel = deviceModel,
+            appVersion = appVersion,
             contextId = null
         )
         pairingToken != null -> api.announce(
             gatewayBaseUrl = Config.DEFAULT_GATEWAY_URL,
             token = pairingToken,
-            deviceName = deviceName
+            deviceName = deviceName,
+            deviceModel = deviceModel,
+            appVersion = appVersion
         )
         else -> AnnounceResult.Failure("dispositivo não pareado")
     }
@@ -71,6 +77,22 @@ private fun deviceDisplayName(): String {
     val displayName = if (androidUserId == 0) model else "$model (user $androidUserId)"
     Log.d("SyncLogic", "device display name for self-announce: \"$displayName\"")
     return displayName
+}
+
+/**
+ * Hardware inventory value, intentionally separate from [deviceDisplayName].
+ * The latter adds the Android profile suffix when necessary, while this one
+ * remains the actual device model shared by all profiles on the same hardware.
+ */
+private fun deviceHardwareModel(): String {
+    val manufacturer = Build.MANUFACTURER?.trim().orEmpty()
+    val model = Build.MODEL?.trim().orEmpty()
+    return when {
+        model.isBlank() && manufacturer.isBlank() -> "Android device"
+        model.isBlank() -> manufacturer
+        manufacturer.isBlank() || model.startsWith(manufacturer, ignoreCase = true) -> model
+        else -> "$manufacturer $model"
+    }
 }
 
 /** Returns a live access token, refreshing it first if it's expired/near-expiry. Null if not logged in via Modo B. */

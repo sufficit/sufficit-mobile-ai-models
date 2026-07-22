@@ -23,8 +23,8 @@ android {
         applicationId = "com.sufficit.ai.mobiledevice"
         minSdk = 28
         targetSdk = 35
-        versionCode = 4
-        versionName = "0.4.0"
+        versionCode = 5
+        versionName = "0.4.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -77,6 +77,7 @@ android {
     buildFeatures {
         compose = true
         aidl = true
+        buildConfig = true
     }
 
     // PairingApi logs via android.util.Log — AGP's stub android.jar throws on any Android
