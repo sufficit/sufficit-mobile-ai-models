@@ -59,6 +59,23 @@ class ModelRegistry(context: Context) {
         prefs.edit().putString(keyFor(kind), value).apply()
     }
 
+    /** Motor que deve permanecer residente, inclusive após reinício do processo. */
+    fun activeEngineKind(): ModelKind {
+        val stored = prefs.getString(KEY_ACTIVE_ENGINE_KIND, null)
+        return stored?.let { runCatching { ModelKind.valueOf(it) }.getOrNull() }
+            // Migração de instalações antigas: transcrição só existe quando o
+            // usuário a escolheu explicitamente; embedding pode ser automático.
+            ?: if (activeModelFileName(ModelKind.TRANSCRIPTION) != null) {
+                ModelKind.TRANSCRIPTION
+            } else {
+                ModelKind.EMBEDDING
+            }
+    }
+
+    fun setActiveEngineKind(kind: ModelKind) {
+        prefs.edit().putString(KEY_ACTIVE_ENGINE_KIND, kind.name).apply()
+    }
+
     fun installedModels(context: Context, kind: ModelKind): List<File> =
         ModelsDir(context).listFiles { file -> file.isFile && file.name.endsWith(kind.fileExtension) }
             ?.sortedBy { it.name }
@@ -77,5 +94,6 @@ class ModelRegistry(context: Context) {
         // model before Whisper support shipped keep it, no silent reset.
         const val KEY_ACTIVE_EMBEDDING_MODEL = "active_model_file_name"
         const val KEY_ACTIVE_TRANSCRIPTION_MODEL = "active_transcription_model_file_name"
+        const val KEY_ACTIVE_ENGINE_KIND = "active_engine_kind"
     }
 }
