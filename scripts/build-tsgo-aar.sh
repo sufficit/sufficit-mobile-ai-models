@@ -18,6 +18,15 @@ if [ ! -d "$ANDROID_NDK_HOME" ]; then
   exit 1
 fi
 
+# embedding.go's cgo directives (android build tag) link against these — see
+# scripts/build-llama-static.sh's own doc for why static/pinned-tag. Skipped if already built
+# (LLAMA_BUILD_DIR/tag change invalidation is the caller's responsibility, same as the other
+# build-*.sh scripts here).
+if [ ! -f "$TSGO_DIR/.llama-static/lib/libllama.a" ]; then
+  echo "==> .llama-static missing, building it first (scripts/build-llama-static.sh)"
+  "$REPO_ROOT/scripts/build-llama-static.sh"
+fi
+
 cd "$TSGO_DIR"
 go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
 export PATH="$PATH:$(go env GOPATH)/bin"

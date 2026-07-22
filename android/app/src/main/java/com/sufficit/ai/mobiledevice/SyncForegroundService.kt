@@ -98,6 +98,22 @@ class SyncForegroundService : Service() {
                 val name = intent.getStringExtra(ModelRuntimeService.EXTRA_ACTIVE_TRANSCRIPTION_MODEL).orEmpty()
                 tsgo.Tsgo.setActiveTranscriptionModel(name)
 
+                // The actual embedding model load/unload now happens here — this process is
+                // the only one running tsgo's HTTP server (see NativeEmbeddingManager's kdoc
+                // for the full cross-process story). ModelRuntimeService (:modelruntime) can
+                // only ever record *intent*; this is where it's carried out for real.
+                // loadEmbeddingModel is idempotent (no-ops if this exact path is already
+                // loaded) — no need to track "did we already load this" separately here.
+                val embeddingPath = intent.getStringExtra(ModelRuntimeService.EXTRA_EMBEDDING_MODEL_PATH)
+                if (embeddingPath.isNullOrEmpty()) {
+                    tsgo.Tsgo.unloadEmbeddingModel()
+                } else {
+                    val loadError = tsgo.Tsgo.loadEmbeddingModel(embeddingPath)
+                    if (loadError.isNotEmpty()) {
+                        android.util.Log.e("SyncForegroundService", "loadEmbeddingModel(\"$embeddingPath\") failed: $loadError")
+                    }
+                }
+
                 // Every installed Whisper model should be discoverable (GET /v1/models), not
                 // just whichever one is currently selected — a device commonly has more than
                 // one downloaded at once. installedModels() is a plain filesystem scan, safe to
@@ -110,20 +126,20 @@ class SyncForegroundService : Service() {
                 tsgo.Tsgo.setInstalledTranscriptionModels(installedNamesJson)
 
                 // Same idea for embeddings — a device can have more than one downloaded (e.g.
-                // both DeviceModelCatalog recommendations). llama-server can only ever have ONE
-                // .gguf loaded at a time, so any OTHER installed file needs its catalog entry
-                // synthesized here rather than read off a live server; LlamaServerManager.aliasFor
-                // is deterministic from the filename alone (confirmed against a real device
-                // response), so the id is guaranteed to match what llama-server itself would
-                // report once that file IS loaded — dimensions come from DeviceModelCatalog when
-                // the file matches a known recommendation, 0 (omitted) otherwise.
+                // both DeviceModelCatalog recommendations). Only ONE .gguf is ever loaded at a
+                // time (NativeEmbeddingManager), so any OTHER installed file needs its catalog
+                // entry synthesized here rather than read off the live model; aliasFor is
+                // deterministic from the filename alone (confirmed against a real device
+                // response), so the id is guaranteed to match what the loaded model itself
+                // would report — dimensions come from DeviceModelCatalog when the file matches
+                // a known recommendation, 0 (omitted) otherwise.
                 val installedEmbeddings = syncRegistry.installedModels(applicationContext, ModelKind.EMBEDDING)
                     .map { file ->
                         val dimensions = DeviceModelCatalog.all
                             .firstOrNull { it.kind == ModelKind.EMBEDDING && it.fileName == file.name }
                             ?.dimensions ?: 0
                         org.json.JSONObject()
-                            .put("id", LlamaServerManager.aliasFor(file))
+                            .put("id", NativeEmbeddingManager.aliasFor(file))
                             .put("dimensions", dimensions)
                     }
                 val installedEmbeddingsJson = org.json.JSONArray(installedEmbeddings).toString()

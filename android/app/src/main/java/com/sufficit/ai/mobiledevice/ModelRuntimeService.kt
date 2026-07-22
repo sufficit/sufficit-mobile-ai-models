@@ -24,7 +24,7 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
- * Owns both [LlamaServerManager] (embeddings) and [WhisperServerManager] (transcription)
+ * Owns both [NativeEmbeddingManager] (embeddings) and [WhisperServerManager] (transcription)
  * lifecycles and all model downloads — the one and only thing in the app allowed to touch
  * either. Runs in its own process (`android:process=":modelruntime"` in the manifest),
  * deliberately separate from [SyncForegroundService]'s process: a native subprocess crash, an
@@ -33,25 +33,36 @@ import java.io.File
  * pode derrubar o serviço de api, devem ser processos diferentes". Two separate processes is
  * the only way Android actually guarantees that (a crash only kills its own process).
  *
+ * Embedding inference itself no longer runs here, though — it moved in-process into tsgo's Go
+ * runtime (cgo bindings to llama.cpp, see android-tsgo/embedding.go), which lives in `:sync`
+ * (TailscaleManager/SyncForegroundService), not this process. [NativeEmbeddingManager] can only
+ * record which file *should* be loaded; [broadcastStatus] carries that over to :sync the same
+ * way transcription's active-model-name already did (see [NativeEmbeddingManager]'s own kdoc
+ * for the full cross-process story, and SyncForegroundService.kt's onCreate). The crash-
+ * isolation property above is correspondingly weaker for embeddings now: a cgo/llama.cpp crash
+ * happens inside :sync's own process, same as everything else running there. Kept the
+ * subprocess model for transcription (WhisperServerManager, still a real child process) — only
+ * embeddings migrated so far.
+ *
  * Only one engine is ever resident at a time — [activeEngineKind] tracks which, [managerFor] and
  * [testerFor] dispatch by [ModelKind] so this service doesn't duplicate every action's logic
- * per engine. Real RAM-safety hardening for the Galaxy A51 (3.6GB total): llama-server
- * (~1.1GB model) and whisper-server loaded together push this device into swap thrashing.
- * Mutual exclusion avoids that at the cost of a cold-start delay when switching which
- * capability is active; the external API shape doesn't change (a capability that isn't
- * currently resident just answers with tsgo's existing "no model loaded" 503, same as today
- * when a server hasn't started yet). Note this is NOT what was causing the infinite ~90s
- * restart loop found during the same investigation — that was a missing
- * `network_security_config.xml` blocking every one of this app's own OkHttp calls to
- * 127.0.0.1 (including every /health probe), fixed separately. Kept mutual exclusion anyway
- * because the memory pressure it prevents is real, independent of that bug.
+ * per engine. Real RAM-safety hardening for the Galaxy A51 (3.6GB total): an embedding model
+ * (~1.1GB) and whisper-server loaded together push this device into swap thrashing. Mutual
+ * exclusion avoids that at the cost of a cold-start delay when switching which capability is
+ * active; the external API shape doesn't change (a capability that isn't currently resident
+ * just answers with tsgo's existing "no model loaded" 503, same as today when nothing's
+ * loaded). Note this is NOT what was causing the infinite ~90s restart loop found during the
+ * same investigation — that was a missing `network_security_config.xml` blocking every one of
+ * this app's own OkHttp calls to 127.0.0.1 (including every /health probe), fixed separately.
+ * Kept mutual exclusion anyway because the memory pressure it prevents is real, independent of
+ * that bug.
  *
  * Communication is one-way-command / broadcast-result, not a bound service: the UI process
  * (MainActivity/ModelsScreen) sends [ACTION_SWITCH_TO]/[ACTION_TEST]/[ACTION_TEST_API]/
  * [ACTION_STOP] (each with an [EXTRA_MODEL_KIND]) via startService(), and this service reports
  * outcomes via explicit
  * (own-package-only) broadcasts — [ACTION_STATUS_CHANGED], [ACTION_DOWNLOAD_PROGRESS],
- * [ACTION_TEST_RESULT]. [LlamaServerManager]/[WhisperServerManager] themselves stay plain
+ * [ACTION_TEST_RESULT]. [NativeEmbeddingManager]/[WhisperServerManager] themselves stay plain
  * Kotlin singletons (not cross-process safe on their own — see their own kdoc) precisely
  * because only this one process ever touches them now.
  */
@@ -139,7 +150,7 @@ class ModelRuntimeService : Service() {
 
     override fun onDestroy() {
         scope.cancel()
-        LlamaServerManager.stop()
+        NativeEmbeddingManager.stop()
         WhisperServerManager.stop()
         super.onDestroy()
     }
@@ -431,12 +442,12 @@ class ModelRuntimeService : Service() {
         }
 
         registry.setActiveModelFileName(ModelKind.EMBEDDING, pick.fileName)
-        LlamaServerManager.start(applicationContext, destination)
+        NativeEmbeddingManager.start(applicationContext, destination)
         broadcastStatus()
     }
 
     private fun broadcastStatus() {
-        val embeddingRunning = LlamaServerManager.isRunning()
+        val embeddingRunning = NativeEmbeddingManager.isRunning()
         val embeddingActive = registry.activeModelFileName(ModelKind.EMBEDDING)
         val transcriptionRunning = WhisperServerManager.isRunning()
         val transcriptionActive = registry.activeModelFileName(ModelKind.TRANSCRIPTION)
@@ -463,6 +474,10 @@ class ModelRuntimeService : Service() {
                 .putExtra(EXTRA_ACTIVE_MODEL, embeddingActive)
                 .putExtra(EXTRA_TRANSCRIPTION_RUNNING, transcriptionRunning)
                 .putExtra(EXTRA_ACTIVE_TRANSCRIPTION_MODEL, transcriptionActive)
+                // What :sync's copy of tsgo should actually have loaded right now — see
+                // NativeEmbeddingManager's kdoc for why this indirection exists at all. Null
+                // when nothing should be resident (mirrors embeddingRunning == false).
+                .putExtra(EXTRA_EMBEDDING_MODEL_PATH, NativeEmbeddingManager.currentPath())
         )
     }
 
@@ -545,6 +560,7 @@ class ModelRuntimeService : Service() {
         const val EXTRA_ACTIVE_MODEL = "activeModel"
         const val EXTRA_TRANSCRIPTION_RUNNING = "transcriptionRunning"
         const val EXTRA_ACTIVE_TRANSCRIPTION_MODEL = "activeTranscriptionModel"
+        const val EXTRA_EMBEDDING_MODEL_PATH = "embeddingModelPath"
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, ModelRuntimeService::class.java))

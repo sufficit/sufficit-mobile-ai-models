@@ -1,0 +1,2 @@
+# scripts/build-llama-static.sh output — ~110MB of static libs, rebuild locally, don't commit.
+.llama-static/

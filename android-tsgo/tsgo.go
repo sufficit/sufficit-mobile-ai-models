@@ -44,9 +44,10 @@ const ModelPort = 8090
 const WhisperPort = 8091
 
 var (
-	mu         sync.Mutex
-	server     *tsnet.Server
-	httpServer *http.Server
+	mu              sync.Mutex
+	server          *tsnet.Server
+	httpServer      *http.Server
+	localHTTPServer *http.Server
 
 	transcriptionMetaMu              sync.RWMutex
 	activeModelName                  string
@@ -183,13 +184,35 @@ func Start(controlURL, authKey, hostname, stateDir string) string {
 	transcriptionMetaMu.Unlock()
 
 	server = s
-	httpServer = &http.Server{Handler: buildRouter()}
+	router := buildRouter()
+	httpServer = &http.Server{Handler: router}
 
 	go func() {
 		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[tsgo] http serve error: %v", err)
 		}
 	}()
+
+	// Second, real (not tsnet-virtual) listener on loopback, same handler. Needed now that
+	// embedding inference moved in-process into this same Go runtime (see embedding.go /
+	// LoadEmbeddingModel's doc): this process (:sync) is the only one with a resident model,
+	// so ModelRuntimeService's local test buttons (:modelruntime, LocalEmbeddingTester —
+	// unlike LocalEmbeddingCliTester, which now calls TestEmbedding directly, no HTTP) need an
+	// actual loopback socket to hit, not just the tsnet-virtual one only reachable from other
+	// tailnet nodes. Harmless to also have this when nothing's testing: same 503 "no model
+	// loaded" behavior as the tailnet-facing listener when nothing's resident.
+	localLn, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(ModelPort))
+	if err != nil {
+		log.Printf("[tsgo] local loopback listen failed (local test buttons won't work, tailnet-facing serving is unaffected): %v", err)
+	} else {
+		log.Printf("[tsgo] local loopback listener up on 127.0.0.1:%d", ModelPort)
+		localHTTPServer = &http.Server{Handler: router}
+		go func() {
+			if err := localHTTPServer.Serve(localLn); err != nil && err != http.ErrServerClosed {
+				log.Printf("[tsgo] local http serve error: %v", err)
+			}
+		}()
+	}
 
 	return currentStatusLocked()
 }
@@ -202,6 +225,10 @@ func Stop() {
 	if httpServer != nil {
 		_ = httpServer.Close()
 		httpServer = nil
+	}
+	if localHTTPServer != nil {
+		_ = localHTTPServer.Close()
+		localHTTPServer = nil
 	}
 	if server != nil {
 		_ = server.Close()
@@ -282,6 +309,75 @@ func SetInstalledTranscriptionModels(namesJSON string) {
 	transcriptionMetaMu.Unlock()
 }
 
+// LoadEmbeddingModel loads modelPath as the resident in-process embedding model (see
+// embedding.go) — replaces LlamaServerManager.start()/switchTo() from the old
+// subprocess-per-engine architecture. Must be called from :sync, same cross-process reasoning
+// as SetActiveTranscriptionModel: the HTTP server that actually serves /v1/embeddings
+// (buildRouter, started via Start() from TailscaleManager/SyncForegroundService) runs in :sync,
+// and Go globals — including the loaded llama_context this holds onto — don't cross process
+// boundaries. A call made from :modelruntime would load a model into a copy of this package
+// nothing ever serves requests from. Returns "" on success, an error message otherwise.
+func LoadEmbeddingModel(modelPath string) string {
+	if err := loadEmbeddingModel(modelPath); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// UnloadEmbeddingModel frees the resident embedding model, if any. Safe to call unconditionally
+// (e.g. before loading a different one, or when the user deletes the active model).
+func UnloadEmbeddingModel() {
+	unloadEmbeddingModel()
+}
+
+// EmbeddingModelLoaded reports whether an embedding model is currently resident in this process.
+func EmbeddingModelLoaded() bool {
+	return isEmbeddingModelLoaded()
+}
+
+// embeddingTestResult mirrors Kotlin's EmbeddingTestResult sealed class shape (see
+// LocalEmbeddingCliTester.kt) — gomobile can't export structs directly, only primitive
+// types/JSON strings, same reasoning as Status.
+type embeddingTestResult struct {
+	Success    bool   `json:"success"`
+	Dimensions int    `json:"dimensions,omitempty"`
+	LatencyMs  int64  `json:"latencyMs,omitempty"`
+	Error      string `json:"error,omitempty"`
+}
+
+// TestEmbedding loads modelPath (if not already resident — see LoadEmbeddingModel) and runs one
+// embedding over text, entirely in-process. This IS the "local, no-API" model test now:
+// LocalEmbeddingCliTester.kt calls this instead of spawning the llama-embedding CLI subprocess
+// it used to (PLAN: native inference migration — the CLI tester was itself only a few days old,
+// added specifically to decouple "does this model work" from the HTTP/API layer; native
+// in-process inference is a strictly better way to answer that same question, since there's no
+// longer a subprocess to spawn at all). Safe to call from any process — unlike
+// LoadEmbeddingModel/the tailnet-serving path, a local test's loaded model is scoped to
+// whichever process calls this and doesn't need to be :sync.
+func TestEmbedding(modelPath, text string) string {
+	start := time.Now()
+	if err := loadEmbeddingModel(modelPath); err != nil {
+		return toEmbeddingTestJSON(embeddingTestResult{Error: err.Error()})
+	}
+	vec, err := embed(text)
+	if err != nil {
+		return toEmbeddingTestJSON(embeddingTestResult{Error: err.Error()})
+	}
+	return toEmbeddingTestJSON(embeddingTestResult{
+		Success:    true,
+		Dimensions: len(vec),
+		LatencyMs:  time.Since(start).Milliseconds(),
+	})
+}
+
+func toEmbeddingTestJSON(r embeddingTestResult) string {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return `{"success":false,"error":"result marshal failed"}`
+	}
+	return string(b)
+}
+
 func toJSON(s Status) string {
 	b, err := json.Marshal(s)
 	if err != nil {
@@ -301,8 +397,34 @@ func buildRouter() http.Handler {
 	mux.Handle("/v1/audio/translations", newWhisperTranslateReverseProxy(WhisperPort))
 	mux.Handle("/v1/audio/", newWhisperReverseProxy(WhisperPort))
 	mux.Handle("/v1/models", newModelsListProxy(ModelPort))
-	mux.Handle("/", newReverseProxy(ModelPort))
+	// Served natively in-process (embedding.go) instead of reverse-proxying to a spawned
+	// llama-server subprocess — see LoadEmbeddingModel's doc for why.
+	mux.Handle("/v1/embeddings", newEmbeddingsHandler())
+	mux.Handle("/health", newHealthHandler())
+	// NOT a reverse proxy to 127.0.0.1:ModelPort anymore: this same process now ALSO listens
+	// on that exact address (Start()'s localHTTPServer, for local test buttons) — proxying
+	// there from inside the process already serving it would just be a pointless self-loop.
+	// Was only ever needed for llama-server routes this app doesn't use (chat/completions
+	// etc.) now that /v1/embeddings and /v1/models are handled explicitly above; anything
+	// else genuinely has nowhere to go.
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	})
 	return mux
+}
+
+// newHealthHandler reports this device as healthy whenever the tsnet node itself is up and
+// serving — matching the old llama-server subprocess's /health semantics (which only ever
+// confirmed "the process answers HTTP", not "a model happens to be loaded"; an idle/no-model
+// device is still a healthy device, just one with nothing to dispatch to right now).
+func newHealthHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
 }
 
 // noModelBody is returned (as a synthetic 503) when the local model server for this
@@ -312,21 +434,6 @@ func buildRouter() http.Handler {
 // (including the backend's own) surfaces as an opaque transport failure with no way
 // to distinguish "phone unreachable" from "phone reachable, nothing loaded yet".
 const noModelBody = `{"error":"no model loaded","status":"idle"}`
-
-// newReverseProxy forwards to the given local port unchanged (path/method/body as-is —
-// whisper-server is launched with --inference-path /v1/audio/transcriptions precisely so
-// no path rewriting is needed here to keep the OpenAI-compatible shape).
-func newReverseProxy(port int) http.Handler {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[tsgo] dial 127.0.0.1:%d failed (no model loaded?): %v", port, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(noModelBody))
-	}
-	return proxy
-}
 
 type startTimeCtxKey struct{}
 

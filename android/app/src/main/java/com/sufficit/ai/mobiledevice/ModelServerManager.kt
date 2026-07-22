@@ -4,10 +4,10 @@ import android.content.Context
 import java.io.File
 
 /**
- * Shared shape of [LlamaServerManager] and [WhisperServerManager] — lets
+ * Shared shape of [NativeEmbeddingManager] and [WhisperServerManager] — lets
  * [ModelRuntimeService] dispatch by [ModelKind] instead of duplicating every action's
  * dispatch logic per engine. Each implementation stays a singleton `object`, not a `class`:
- * same reasoning as [LlamaServerManager]'s own kdoc — one shared process handle per engine,
+ * same reasoning as [WhisperServerManager]'s own kdoc — one shared process handle per engine,
  * no split-brain about what's actually running.
  */
 interface ModelServerManager {
@@ -18,9 +18,9 @@ interface ModelServerManager {
     fun stop()
 }
 
-/** The one [LlamaServerManager]/[WhisperServerManager] singleton for a given [ModelKind]. */
+/** The one [NativeEmbeddingManager]/[WhisperServerManager] singleton for a given [ModelKind]. */
 fun managerFor(kind: ModelKind): ModelServerManager = when (kind) {
-    ModelKind.EMBEDDING -> LlamaServerManager
+    ModelKind.EMBEDDING -> NativeEmbeddingManager
     ModelKind.TRANSCRIPTION -> WhisperServerManager
 }
 
