@@ -26,11 +26,12 @@ fun ModelFile(context: Context): File = File(context.filesDir, "llama/model.gguf
 fun ModelsDir(context: Context): File = File(context.filesDir, "models")
 
 /**
- * Which native engine a model file is for. Different binary ([LlamaServerManager] vs
- * [WhisperServerManager]), different local port (tsgo.ModelPort vs tsgo.WhisperPort), different
+ * Which native engine a model file is for. Different cgo bindings ([NativeEmbeddingManager]'s
+ * llama.cpp, android-tsgo/embedding.go, vs [NativeTranscriptionManager]'s whisper.cpp,
+ * android-tsgo/transcription.go), both served through the same tsgo.ModelPort now, different
  * file format on disk — GGUF for embeddings, whisper.cpp's own ggml .bin for transcription.
- * Both can have an active model and a running server process at the same time; see PLAN
- * "Whisper support".
+ * Only one engine is ever resident at a time (mutual exclusion — see [ModelRuntimeService]'s
+ * kdoc for why: this device's RAM can't hold both loaded together).
  */
 enum class ModelKind(val fileExtension: String) {
     EMBEDDING(".gguf"),

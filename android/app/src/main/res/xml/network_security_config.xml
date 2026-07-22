@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-    Allows plain HTTP only to the loopback interface, where llama-server/whisper-server bind
-    (see LlamaServerManager/WhisperServerManager — never on 0.0.0.0, never past the tailnet's own
-    TLS termination). Everything else keeps the platform default (cleartext blocked, targetSdk 28+).
+    Allows plain HTTP only to the loopback interface, where tsgo's local listener binds (see
+    tsgo.go's Start() — never on 0.0.0.0, never past the tailnet's own TLS termination).
+    Everything else keeps the platform default (cleartext blocked, targetSdk 28+).
 
     Found on-device: with no config at all, every OkHttp call this app makes to 127.0.0.1 threw
     UnknownServiceException ("CLEARTEXT communication to 127.0.0.1 not permitted") from day one —

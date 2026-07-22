@@ -15,16 +15,18 @@ sealed class TranscriptionTestResult {
 }
 
 /**
- * Fires a single sample transcription request against the locally-running whisper-server (see
- * [WhisperServerManager]) — the speech-to-text counterpart to [LocalEmbeddingTester], same
- * "does this model load and answer at all" purpose and same poll-until-/health-ready reasoning.
+ * Fires a sample transcription request against tsgo's local HTTP loopback listener (see
+ * [NativeTranscriptionManager]/android-tsgo/transcription.go) — the speech-to-text counterpart
+ * to [LocalEmbeddingTester], same "does this model load and answer at all" purpose and same
+ * poll-the-real-endpoint-until-ready reasoning (see [LocalEmbeddingTester]'s kdoc for why a
+ * separate /health probe isn't a reliable readiness signal under the native architecture).
  *
  * The sample audio is a synthesized silent WAV generated on the fly, not a bundled asset — this
  * repo has no real speech sample to ship, and generating one deterministically in code avoids
- * adding a binary asset just for a smoke test. whisper-server transcribing silence into an
- * (expectedly empty or near-empty) result still proves the full pipeline works: model loads,
- * server answers, response is well-formed JSON. That's the same bar [LocalEmbeddingTester] sets
- * with a throwaway "test" string — this isn't a quality/accuracy check.
+ * adding a binary asset just for a smoke test. Transcribing silence into an (expectedly empty or
+ * near-empty) result still proves the full pipeline works: model loads, server answers, response
+ * is well-formed JSON. That's the same bar [LocalEmbeddingTester] sets with a throwaway "test"
+ * string — this isn't a quality/accuracy check.
  */
 class LocalTranscriptionTester(
     private val client: OkHttpClient = OkHttpClient.Builder()
@@ -45,56 +47,40 @@ class LocalTranscriptionTester(
     }
 
     suspend fun test(port: Int, readyTimeoutMs: Long = 30_000L): TranscriptionTestResult {
-        val ready = waitUntilReady(port, readyTimeoutMs)
-        if (!ready) return TranscriptionTestResult.Failure("modelo não ficou pronto a tempo")
+        val body = MultipartBody.Builder().setType(MultipartBody.FORM)
+            .addFormDataPart(
+                "file", "sample.wav",
+                silentWav().toRequestBody("audio/wav".toMediaType())
+            )
+            .build()
+        val request = Request.Builder()
+            .url("http://127.0.0.1:$port/v1/audio/transcriptions")
+            .post(body)
+            .build()
 
-        return try {
-            val body = MultipartBody.Builder().setType(MultipartBody.FORM)
-                .addFormDataPart(
-                    "file", "sample.wav",
-                    silentWav().toRequestBody("audio/wav".toMediaType())
-                )
-                .build()
-            val request = Request.Builder()
-                .url("http://127.0.0.1:$port/v1/audio/transcriptions")
-                .post(body)
-                .build()
-
-            val start = System.currentTimeMillis()
-            client.newCall(request).execute().use { response ->
-                val elapsed = System.currentTimeMillis() - start
-                if (!response.isSuccessful) {
-                    return TranscriptionTestResult.Failure("HTTP ${response.code}")
-                }
-                val json = JSONObject(response.body?.string().orEmpty())
-                if (!json.has("text")) {
-                    return TranscriptionTestResult.Failure("resposta sem texto")
-                }
-                TranscriptionTestResult.Success(text = json.optString("text"), latencyMs = elapsed)
-            }
-        } catch (ex: Exception) {
-            TranscriptionTestResult.Failure(ex.message ?: "falha no teste")
-        }
-    }
-
-    /** Polls with [healthClient] (3s budget per attempt), not [client] (30s read timeout) —
-     * a single sluggish/stuck attempt on the slow client would burn the whole [timeoutMs]
-     * budget in one shot instead of actually retrying. Found on-device: a phone running two
-     * model servers at once can be slow enough that this mattered in practice, not just in
-     * theory. */
-    private suspend fun waitUntilReady(port: Int, timeoutMs: Long): Boolean {
-        val deadline = System.currentTimeMillis() + timeoutMs
+        val deadline = System.currentTimeMillis() + readyTimeoutMs
         while (System.currentTimeMillis() < deadline) {
+            val start = System.currentTimeMillis()
             try {
-                val request = Request.Builder().url("http://127.0.0.1:$port/health").build()
-                healthClient.newCall(request).execute().use { response ->
-                    if (response.isSuccessful) return true
+                client.newCall(request).execute().use { response ->
+                    if (response.code == 503) {
+                        return@use // not loaded yet — fall through to the delay below and retry
+                    }
+                    if (!response.isSuccessful) {
+                        return TranscriptionTestResult.Failure("HTTP ${response.code}")
+                    }
+                    val elapsed = System.currentTimeMillis() - start
+                    val json = JSONObject(response.body?.string().orEmpty())
+                    if (!json.has("text")) {
+                        return TranscriptionTestResult.Failure("resposta sem texto")
+                    }
+                    return TranscriptionTestResult.Success(text = json.optString("text"), latencyMs = elapsed)
                 }
             } catch (ex: Exception) {
-                android.util.Log.w("LocalTranscriptionTester", "waitUntilReady($port) probe failed: ${ex.javaClass.simpleName}: ${ex.message}")
+                android.util.Log.w("LocalTranscriptionTester", "test($port) attempt failed: ${ex.javaClass.simpleName}: ${ex.message}")
             }
             delay(500)
         }
-        return false
+        return TranscriptionTestResult.Failure("modelo não ficou pronto a tempo")
     }
 }

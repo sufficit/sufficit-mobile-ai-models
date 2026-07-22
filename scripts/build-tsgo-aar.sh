@@ -27,6 +27,14 @@ if [ ! -f "$TSGO_DIR/.llama-static/lib/libllama.a" ]; then
   "$REPO_ROOT/scripts/build-llama-static.sh"
 fi
 
+# transcription.go's cgo directives link against these — see scripts/build-whisper-static.sh's
+# own doc for why (and for the symbol-prefixing trick that lets this coexist with .llama-static
+# above in one binary).
+if [ ! -f "$TSGO_DIR/.whisper-static/lib/libwhisper.a" ]; then
+  echo "==> .whisper-static missing, building it first (scripts/build-whisper-static.sh)"
+  "$REPO_ROOT/scripts/build-whisper-static.sh"
+fi
+
 cd "$TSGO_DIR"
 go install golang.org/x/mobile/cmd/gomobile golang.org/x/mobile/cmd/gobind
 export PATH="$PATH:$(go env GOPATH)/bin"

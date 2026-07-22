@@ -9,16 +9,11 @@ import java.io.File
 /**
  * Runs a real embedding entirely in-process via [tsgo.Tsgo.testEmbedding] — cgo bindings
  * straight to llama.cpp's C API (see android-tsgo/embedding.go), no subprocess, no HTTP. The
- * local counterpart to [LocalEmbeddingTester] (which still goes through llama-server's HTTP
- * API): proves "does this model load and produce a real embedding" without touching the API
- * layer at all.
- *
- * Used to spawn `llama-embedding` as a one-shot CLI subprocess (see
- * scripts/build-llama-embedding.sh, still around for the standalone binary but no longer used
- * by this class) — native in-process inference answers the exact same question without paying
- * for a second process spawn, and is the same code path the tailnet-facing /v1/embeddings
- * endpoint itself now uses (see tsgo.go's buildRouter), so this test is a genuine dry run of
- * production behavior, not just a parallel implementation of it.
+ * local counterpart to [LocalEmbeddingTester] (which still goes through the HTTP API): proves
+ * "does this model load and produce a real embedding" without touching the API layer at all —
+ * and is the same code path the tailnet-facing /v1/embeddings endpoint itself uses (see
+ * tsgo.go's buildRouter), so this test is a genuine dry run of production behavior, not just a
+ * parallel implementation of it.
  *
  * Safe to call from any process — unlike loading the model for real tailnet serving (which
  * must happen in :sync, see [tsgo.Tsgo.loadEmbeddingModel]'s doc), a local test's loaded model

@@ -4,12 +4,8 @@
 # directives so tsgo.go can call llama.cpp's C API in-process (no subprocess, no HTTP hop to a
 # spawned server binary). Re-run this whenever the pinned tag below changes.
 #
-# Pinned to the SAME tag as the prebuilt libllama.so et al already in android/app's jniLibs, for
-# the same ABI-compatibility reasoning documented in build-llama-embedding.sh — this script's
-# output is otherwise independent of that one (static vs shared build of the same source).
-#
 # Requires: NDK r27c (ndk;27.2.12479018), cmake, ninja — same toolchain as
-# build-whisper-server.sh / build-llama-embedding.sh.
+# build-whisper-static.sh.
 #
 # Static libc++ linking (see embedding.go's LDFLAGS): the official prebuilt llama-server/
 # llama-embedding binaries link libc++ statically too (confirmed via readelf -d — no

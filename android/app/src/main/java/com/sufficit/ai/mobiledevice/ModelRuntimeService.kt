@@ -24,25 +24,26 @@ import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
- * Owns both [NativeEmbeddingManager] (embeddings) and [WhisperServerManager] (transcription)
- * lifecycles and all model downloads — the one and only thing in the app allowed to touch
- * either. Runs in its own process (`android:process=":modelruntime"` in the manifest),
- * deliberately separate from [SyncForegroundService]'s process: a native subprocess crash, an
- * OOM during a model load, or an unhandled exception mid-download must never be able to take
- * the self-announce/tailnet heartbeat down with it — "a execução/download de um modelo não
- * pode derrubar o serviço de api, devem ser processos diferentes". Two separate processes is
- * the only way Android actually guarantees that (a crash only kills its own process).
+ * Owns both [NativeEmbeddingManager] (embeddings) and [NativeTranscriptionManager]
+ * (transcription) lifecycles and all model downloads — the one and only thing in the app allowed
+ * to touch either. Runs in its own process (`android:process=":modelruntime"` in the manifest),
+ * deliberately separate from [SyncForegroundService]'s process: an OOM during a model load or an
+ * unhandled exception mid-download must never be able to take the self-announce/tailnet
+ * heartbeat down with it — "a execução/download de um modelo não pode derrubar o serviço de api,
+ * devem ser processos diferentes". Two separate processes is the only way Android actually
+ * guarantees that (a crash only kills its own process).
  *
- * Embedding inference itself no longer runs here, though — it moved in-process into tsgo's Go
- * runtime (cgo bindings to llama.cpp, see android-tsgo/embedding.go), which lives in `:sync`
- * (TailscaleManager/SyncForegroundService), not this process. [NativeEmbeddingManager] can only
- * record which file *should* be loaded; [broadcastStatus] carries that over to :sync the same
- * way transcription's active-model-name already did (see [NativeEmbeddingManager]'s own kdoc
- * for the full cross-process story, and SyncForegroundService.kt's onCreate). The crash-
- * isolation property above is correspondingly weaker for embeddings now: a cgo/llama.cpp crash
- * happens inside :sync's own process, same as everything else running there. Kept the
- * subprocess model for transcription (WhisperServerManager, still a real child process) — only
- * embeddings migrated so far.
+ * Neither engine actually runs inference here, though — both moved in-process into tsgo's Go
+ * runtime (cgo bindings to llama.cpp/whisper.cpp, see android-tsgo/embedding.go and
+ * transcription.go), which lives in `:sync` (TailscaleManager/SyncForegroundService), not this
+ * process. [NativeEmbeddingManager]/[NativeTranscriptionManager] can only record which file
+ * *should* be loaded; [broadcastStatus] carries that over to :sync (see
+ * [NativeEmbeddingManager]'s own kdoc for the full cross-process story, and
+ * SyncForegroundService.kt's onCreate). The crash-isolation property above is correspondingly
+ * weaker now than the old subprocess architecture: a cgo/llama.cpp or cgo/whisper.cpp crash
+ * happens inside :sync's own process, same as everything else running there — the two-process
+ * split above still protects the announce/heartbeat loop from a bad model DOWNLOAD, just not
+ * from an inference crash once loaded (there's no longer a subprocess boundary for that).
  *
  * Only one engine is ever resident at a time — [activeEngineKind] tracks which, [managerFor] and
  * [testerFor] dispatch by [ModelKind] so this service doesn't duplicate every action's logic
@@ -62,8 +63,8 @@ import java.io.File
  * [ACTION_STOP] (each with an [EXTRA_MODEL_KIND]) via startService(), and this service reports
  * outcomes via explicit
  * (own-package-only) broadcasts — [ACTION_STATUS_CHANGED], [ACTION_DOWNLOAD_PROGRESS],
- * [ACTION_TEST_RESULT]. [NativeEmbeddingManager]/[WhisperServerManager] themselves stay plain
- * Kotlin singletons (not cross-process safe on their own — see their own kdoc) precisely
+ * [ACTION_TEST_RESULT]. [NativeEmbeddingManager]/[NativeTranscriptionManager] themselves stay
+ * plain Kotlin singletons (not cross-process safe on their own — see their own kdoc) precisely
  * because only this one process ever touches them now.
  */
 class ModelRuntimeService : Service() {
@@ -151,7 +152,7 @@ class ModelRuntimeService : Service() {
     override fun onDestroy() {
         scope.cancel()
         NativeEmbeddingManager.stop()
-        WhisperServerManager.stop()
+        NativeTranscriptionManager.stop()
         super.onDestroy()
     }
 
@@ -269,15 +270,14 @@ class ModelRuntimeService : Service() {
         broadcastStatus()
     }
 
-    /** Local/direct test — spawns llama-embedding or whisper-cli (see
-     * scripts/build-llama-embedding.sh / scripts/build-whisper-server.sh) as a one-shot
-     * process against [fileName] directly. No HTTP, no [ModelServerManager] server involved at
-     * all — this only proves the GGUF/bin file loads and the model itself produces valid
-     * output, decoupled from whether the API layer works. Stops BOTH engines first (not just
-     * the other kind): the CLI test loads its own separate copy of the model into a new
-     * process, which would double up RAM usage against whatever HTTP server happens to already
-     * be resident for the same kind. [restoreActiveEngine] brings back whatever was actually
-     * supposed to be running once the one-shot process exits. */
+    /** Local/direct test — runs inference on [fileName] entirely in-process (see
+     * [tsgo.Tsgo.testEmbedding]/[tsgo.Tsgo.testTranscription]), no HTTP, no
+     * [ModelServerManager] server involved at all. Proves the GGUF/bin file loads and the model
+     * itself produces valid output, decoupled from whether the API layer works. Stops BOTH
+     * engines first (not just the other kind): the test loads its own copy of the model in this
+     * process, which would double up RAM usage against whatever's already resident for the same
+     * kind in :sync. [restoreActiveEngine] brings back whatever was actually supposed to be
+     * running once the test completes. */
     private suspend fun handleTestLocal(kind: ModelKind, fileName: String) {
         val file = File(ModelsDir(applicationContext), fileName)
         for (k in ModelKind.entries) {
@@ -332,6 +332,14 @@ class ModelRuntimeService : Service() {
         if (!alreadyCorrect) {
             deactivateOtherEngines(kind)
             manager.switchTo(applicationContext, file)
+            // switchTo only updates this process's (:modelruntime) intent — the HTTP test below
+            // hits :sync's real loopback listener, which only loads a model in response to this
+            // broadcast (see NativeEmbeddingManager/NativeTranscriptionManager kdoc). Without
+            // this, the test polls a :sync that was never told to load anything and always times
+            // out with "modelo não ficou pronto a tempo" — invisible for embedding as long as
+            // it's already the resident engine from normal auto-provisioning, but always hit for
+            // transcription (never auto-provisioned, essentially never already resident).
+            broadcastStatus()
         }
 
         val intent = Intent(ACTION_TEST_RESULT).setPackage(packageName)
@@ -449,7 +457,7 @@ class ModelRuntimeService : Service() {
     private fun broadcastStatus() {
         val embeddingRunning = NativeEmbeddingManager.isRunning()
         val embeddingActive = registry.activeModelFileName(ModelKind.EMBEDDING)
-        val transcriptionRunning = WhisperServerManager.isRunning()
+        val transcriptionRunning = NativeTranscriptionManager.isRunning()
         val transcriptionActive = registry.activeModelFileName(ModelKind.TRANSCRIPTION)
 
         val notificationParts = mutableListOf(
@@ -478,6 +486,7 @@ class ModelRuntimeService : Service() {
                 // NativeEmbeddingManager's kdoc for why this indirection exists at all. Null
                 // when nothing should be resident (mirrors embeddingRunning == false).
                 .putExtra(EXTRA_EMBEDDING_MODEL_PATH, NativeEmbeddingManager.currentPath())
+                .putExtra(EXTRA_TRANSCRIPTION_MODEL_PATH, NativeTranscriptionManager.currentPath())
         )
     }
 
@@ -561,6 +570,7 @@ class ModelRuntimeService : Service() {
         const val EXTRA_TRANSCRIPTION_RUNNING = "transcriptionRunning"
         const val EXTRA_ACTIVE_TRANSCRIPTION_MODEL = "activeTranscriptionModel"
         const val EXTRA_EMBEDDING_MODEL_PATH = "embeddingModelPath"
+        const val EXTRA_TRANSCRIPTION_MODEL_PATH = "transcriptionModelPath"
 
         fun start(context: Context) {
             ContextCompat.startForegroundService(context, Intent(context, ModelRuntimeService::class.java))

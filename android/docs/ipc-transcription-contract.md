@@ -82,10 +82,12 @@ oneway interface ISufficitTranscriptionCallback {
 ## Implementations
 
 - **Provider**: `sufficit-mobile-ai-models` — `TranscriptionIpcService.kt`, runs in the app's
-  existing `:modelruntime` process so it can read `WhisperServerManager`'s state in-process.
-  `isReady()` reflects whether the on-device whisper.cpp server is currently resident (mutual
-  exclusion with the embedding engine — see `ModelRuntimeService` kdoc — means it is not always
-  on).
+  existing `:modelruntime` process so it can read `NativeTranscriptionManager`'s state
+  in-process. `isReady()` reflects whether the on-device whisper.cpp model is currently resident
+  (mutual exclusion with the embedding engine — see `ModelRuntimeService` kdoc — means it is not
+  always on); `transcribe()` itself calls across to `:sync`'s real HTTP loopback listener, since
+  the resident model only actually lives there (in-process cgo/whisper.cpp, see
+  `android-tsgo/transcription.go`).
 - **Consumer**: `sufficit-android-ai-gateway` — `CompanionTranscriptionClient.kt`
   (`transcription/` package), exposed as `TranscriptionMode.COMPANION` alongside the existing
   LOCAL/REMOTE backends.

@@ -5,70 +5,36 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
-import java.util.concurrent.TimeUnit
 
 /**
- * Runs whisper-cli (see scripts/build-whisper-server.sh) directly against a GGUF/bin model
- * file — a one-shot process, no HTTP, no persistent server — the local counterpart to
- * [LocalTranscriptionTester]. Proves "does this model load and produce a real transcription"
- * without going through [WhisperServerManager]/the OpenAI-compatible API at all.
+ * Runs a real transcription entirely in-process via [tsgo.Tsgo.testTranscription] — cgo
+ * bindings straight to whisper.cpp's C API (see android-tsgo/transcription.go), no subprocess,
+ * no HTTP. The local counterpart to [LocalTranscriptionTester] (which still goes through the
+ * HTTP API): proves "does this model load and produce a real transcription" without touching
+ * the API layer at all — and is the same code path the tailnet-facing /v1/audio/transcriptions
+ * endpoint itself uses (see tsgo.go's buildRouter), so this test is a genuine dry run of
+ * production behavior, not just a parallel implementation of it.
+ *
+ * Safe to call from any process — unlike loading the model for real tailnet serving (which
+ * must happen in :sync, see [tsgo.Tsgo.loadTranscriptionModel]'s doc), a local test's loaded
+ * model is scoped to whichever process calls this (:modelruntime here) and doesn't affect what
+ * :sync has resident.
  */
 class LocalWhisperCliTester {
     suspend fun test(context: Context, modelFile: File): TranscriptionTestResult = withContext(Dispatchers.IO) {
-        val nativeDir = context.applicationInfo.nativeLibraryDir
-        val binary = File(nativeDir, "libwhispercli.so")
-        if (!binary.exists()) {
-            return@withContext TranscriptionTestResult.Failure("binário whisper-cli ausente")
-        }
-
-        val workDir = File(context.filesDir, "cli-test").apply { mkdirs() }
-        val wavFile = File(workDir, "sample.wav")
-        val outputBase = File(workDir, "result")
-        val outputJson = File(workDir, "result.json")
-        var process: Process? = null
-        return@withContext try {
-            wavFile.writeBytes(silentWav())
-
-            val builder = ProcessBuilder(
-                binary.absolutePath,
-                "-m", modelFile.absolutePath,
-                "-ng", "-nfa", "-np",
-                "-oj", "-of", outputBase.absolutePath,
-                wavFile.absolutePath
-            )
-            builder.environment()["LD_LIBRARY_PATH"] = nativeDir
-            builder.redirectErrorStream(true)
-            builder.redirectOutput(File(workDir, "whisper-cli.log"))
-
-            val start = System.currentTimeMillis()
-            val p = builder.start()
-            process = p
-            val finished = p.waitFor(30, TimeUnit.SECONDS)
-            val elapsed = System.currentTimeMillis() - start
-            if (!finished) {
-                p.destroyForcibly()
-                return@withContext TranscriptionTestResult.Failure("modelo não respondeu a tempo")
-            }
-            if (p.exitValue() != 0) {
-                return@withContext TranscriptionTestResult.Failure("processo saiu com código ${p.exitValue()}")
-            }
-            if (!outputJson.exists()) {
-                return@withContext TranscriptionTestResult.Failure("saída não encontrada")
-            }
-
-            val json = JSONObject(outputJson.readText())
-            val transcription = json.optJSONArray("transcription")
-            val text = if (transcription != null && transcription.length() > 0) {
-                transcription.getJSONObject(0).optString("text")
+        try {
+            val resultJson = tsgo.Tsgo.testTranscription(modelFile.absolutePath, silentWav())
+            val json = JSONObject(resultJson)
+            if (json.optBoolean("success")) {
+                TranscriptionTestResult.Success(
+                    text = json.optString("text"),
+                    latencyMs = json.getLong("latencyMs")
+                )
             } else {
-                ""
+                TranscriptionTestResult.Failure(json.optString("error", "falha no teste"))
             }
-            TranscriptionTestResult.Success(text = text, latencyMs = elapsed)
         } catch (ex: Exception) {
             TranscriptionTestResult.Failure(ex.message ?: "falha no teste")
-        } finally {
-            process?.destroyForcibly()
-            workDir.deleteRecursively()
         }
     }
 }

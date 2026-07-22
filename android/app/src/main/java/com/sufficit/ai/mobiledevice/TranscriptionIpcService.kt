@@ -26,14 +26,17 @@ import java.util.concurrent.TimeUnit
  * Exported bound Service implementing the standardized Sufficit Transcription IPC contract
  * (aidl/com/sufficit/ipc/transcription/, docs/ipc-transcription-contract.md) — lets another
  * installed Sufficit app (e.g. sufficit-android-ai-gateway) transcribe audio through this
- * device's already-running whisper-server (see [WhisperServerManager]) without depending on its
- * undocumented loopback port directly.
+ * device's tsgo HTTP server (real loopback listener on [tsgo.Tsgo.ModelPort], see tsgo.go's
+ * Start()) without depending on an undocumented port directly.
  *
  * Runs in the existing `:modelruntime` process (same as [ModelRuntimeService]/
- * [WhisperServerManager]) so [isReady]/[transcribe] can read [WhisperServerManager]'s state
- * directly, in-process — no extra IPC hop on this side. Deliberately a SEPARATE Service from
- * [ModelRuntimeService] (whose `onBind()` intentionally returns null and is designed as
- * internal command/broadcast only, see its kdoc) rather than repurposing it, so the
+ * [NativeTranscriptionManager]) so [isReady] can read [NativeTranscriptionManager]'s recorded
+ * intent directly, in-process — [transcribe] itself still crosses to :sync via a real loopback
+ * HTTP call, same as any other client of this app's OpenAI-compatible API, since the resident
+ * whisper.cpp model only actually lives in :sync's copy of tsgo (see
+ * [NativeTranscriptionManager]'s kdoc for the full cross-process story). Deliberately a SEPARATE
+ * Service from [ModelRuntimeService] (whose `onBind()` intentionally returns null and is
+ * designed as internal command/broadcast only, see its kdoc) rather than repurposing it, so the
  * external-facing binder surface has its own lifecycle/permission boundary independent from the
  * app's own UI-facing control channel.
  */
@@ -59,7 +62,7 @@ class TranscriptionIpcService : Service() {
     private val binder = object : ISufficitTranscriptionService.Stub() {
         override fun getProtocolVersion(): Int = 1
 
-        override fun isReady(): Boolean = WhisperServerManager.isRunning()
+        override fun isReady(): Boolean = NativeTranscriptionManager.isRunning()
 
         override fun transcribe(
             requestId: String,
@@ -67,7 +70,7 @@ class TranscriptionIpcService : Service() {
             languageHint: String,
             callback: ISufficitTranscriptionCallback
         ) {
-            if (!WhisperServerManager.isRunning()) {
+            if (!NativeTranscriptionManager.isRunning()) {
                 runCatching { audio.close() }
                 callback.onError(requestId, ISufficitTranscriptionService.ERROR_NOT_READY, "no transcription model active")
                 return
@@ -84,7 +87,7 @@ class TranscriptionIpcService : Service() {
                     return@launch
                 }
 
-                val port = WhisperServerManager.port
+                val port = tsgo.Tsgo.ModelPort.toInt()
                 val formBuilder = MultipartBody.Builder().setType(MultipartBody.FORM)
                     .addFormDataPart("file", "segment.wav", wavBytes.toRequestBody("audio/wav".toMediaType()))
                 if (languageHint.isNotBlank()) {

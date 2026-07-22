@@ -15,9 +15,12 @@ Implementado:
 - ✅ **tsnet embarcado** (`tsgo`, tsnet-in-gomobile) — o app junta a tailnet
   da Sufficit sozinho, sem depender do app oficial do Tailscale; ver
   `TailscaleManager.kt`/`android-tsgo`.
-- ✅ **llama-server embarcado** — roda como subprocesso nativo a partir de
-  `jniLibs` (`LlamaServerManager.kt`), não mais via `adb shell` num projeto
-  irmão.
+- ✅ **Inferência nativa in-process** — embeddings (llama.cpp) e transcrição
+  (whisper.cpp) rodam via cgo direto no runtime Go do `tsgo` (`android-tsgo/
+  embedding.go`, `transcription.go`), não mais como subprocessos separados
+  (`LlamaServerManager`/`WhisperServerManager`, removidos). `tsgo` já é o
+  processo que serve a API externa pela tailnet — um bind direto evita o
+  spawn/HTTP-hop redundante de um processo filho.
 - ✅ **Model manager** (Fase 6) — busca no Hugging Face, download
   resumível, troca de modelo ativo, smoke-test, remoção (com confirmação).
 - ✅ **Heartbeat em foreground service com política de bateria**
@@ -28,32 +31,30 @@ Implementado:
 - ✅ **Proteção térmica** (PLAN T3.2) — pausa a inferência acima de
   `THERMAL_STATUS_SEVERE`, religa sozinho quando esfria.
 - ✅ **Keep-alive por saúde** (PLAN T3.1) — não só "processo vivo": checa
-  `/health` e recicla o llama-server depois de 3 falhas seguidas.
-- ✅ **Transcrição (Whisper)** — whisper.cpp embarcado (`WhisperServerManager.kt`),
-  mesmo padrão de subprocesso nativo do llama-server, processo/porta local
-  próprios. `tsgo` roteia por path (`/v1/audio/*` → whisper, resto → llama)
-  no mesmo endereço externo da tailnet — uma API só, dois processos locais.
-  Nunca é auto-provisionado (diferente do embedding): só ativa quando o
-  usuário baixa um modelo Whisper explicitamente em "Modelos de IA". Os dois
-  binários nunca ficam residentes ao mesmo tempo — `ModelRuntimeService` faz
-  exclusão mútua (ativar um engine para o outro, com um cold-start na troca),
-  hardening real contra RAM baixa no Galaxy A51 (3.6GB), mesmo não sendo a
-  causa do bug abaixo.
+  `/health` e recarrega o modelo depois de 3 falhas seguidas.
+- ✅ **Transcrição (Whisper)** — whisper.cpp embarcado via cgo
+  (`android-tsgo/transcription.go`), mesmo padrão in-process do embedding.
+  Os dois modelos nunca ficam residentes ao mesmo tempo —
+  `ModelRuntimeService` faz exclusão mútua (ativar um engine desativa o
+  outro, com um cold-start na troca), hardening real contra RAM baixa no
+  Galaxy A51 (3.6GB). Nunca é auto-provisionado (diferente do embedding): só
+  ativa quando o usuário baixa um modelo Whisper explicitamente em "Modelos
+  de IA".
 - ✅ **Fix: cleartext bloqueado para 127.0.0.1** — sem `network_security_config.xml`,
-  toda chamada OkHttp do app pro próprio llama-server/whisper-server (inclusive
+  toda chamada OkHttp do app pro loopback local do próprio `tsgo` (inclusive
   o keep-alive de `/health`) falhava com `UnknownServiceException` desde
   sempre (targetSdk 28+ bloqueia cleartext por padrão) — silenciosamente, o
   catch engolia a exceção. Isso fazia o keep-alive de 3 falhas (PLAN T3.1)
-  reiniciar os dois servers num loop infinito a cada ~90s, e todo smoke-test
-  pela UI falhar com "modelo não ficou pronto a tempo" — mesmo com o servidor
-  nativo respondendo perfeitamente (confirmado via curl direto, bypassando o
+  reiniciar tudo num loop infinito a cada ~90s, e todo smoke-test pela UI
+  falhar com "modelo não ficou pronto a tempo" — mesmo com a inferência
+  nativa respondendo perfeitamente (confirmado via curl direto, bypassando o
   app). Corrigido com `res/xml/network_security_config.xml` liberando
   cleartext só pra 127.0.0.1/localhost.
 - ✅ **Fix: flash attention travava toda transcrição** — build do whisper.cpp
   vem com `flash_attn=1` por padrão; nessa CPU o caminho de flash attention
   trava para sempre em qualquer request de inferência (confirmado: `/health`
-  respondia normal, só a inferência nunca retornava). Corrigido com `-nfa`
-  em `WhisperServerManager.kt`.
+  respondia normal, só a inferência nunca retornava). Corrigido com
+  `flash_attn = false` em `transcription.go`'s `transcriptionContextParams`.
 
 Pendente:
 
@@ -70,17 +71,26 @@ Pendente:
 processo UI (MainActivity/Compose)
     │  broadcasts (ACTION_SYNC_STATE, ACTION_STATUS_CHANGED, ...)
     ├── :sync (SyncForegroundService)
-    │     dono único de performSync/announce e do node tsnet (PLAN T1.1)
+    │     dono único de performSync/announce, do node tsnet e do runtime Go
+    │     (tsgo) que efetivamente roda a inferência in-process via cgo —
+    │     embedding.go (llama.cpp) e transcription.go (whisper.cpp)
     └── :modelruntime (ModelRuntimeService)
-          dono único do LlamaServerManager + WhisperServerManager e do
-          ModelRegistry (PLAN T1.4 / Whisper support)
+          dono único do NativeEmbeddingManager + NativeTranscriptionManager
+          e do ModelRegistry (PLAN T1.4) — só registra *intenção* (qual
+          arquivo devia estar carregado); quem carrega de fato é :sync, via
+          broadcast (ACTION_STATUS_CHANGED) — ver kdoc de
+          NativeEmbeddingManager
 ```
 
-A UI nunca chama `performSync`, `TailscaleManager` ou `LlamaServerManager`
+A UI nunca chama `performSync`, `TailscaleManager` ou `NativeEmbeddingManager`
 diretamente — só envia comandos (`startForegroundService` com uma `action`)
 e escuta broadcasts com o resultado. Isso é deliberado: um crash num
-processo (download OOM, native subprocess, bug de UI) nunca derruba os
-outros dois — cada processo Android só mata a si mesmo.
+processo (download OOM, bug de UI) nunca derruba os outros dois — cada
+processo Android só mata a si mesmo. Diferente de antes (subprocessos
+separados), um crash de inferência (cgo/llama.cpp ou cgo/whisper.cpp) agora
+acontece dentro do próprio processo `:sync` — troca isolamento de crash de
+inferência por não ter mais o overhead de spawn/HTTP-hop de um processo
+filho (ver kdoc de `ModelRuntimeService`).
 
 ## Build local
 
@@ -98,17 +108,26 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 ### Recompilando os binários nativos
 
 Só necessário ao atualizar llama.cpp/whisper.cpp/tsgo, não para builds do
-dia a dia.
+dia a dia — `tsgo.aar` já sai commitado com tudo linkado.
 
-- `llama-server`: build próprio feito fora deste repo (ver kdoc de
-  `LlamaServerManager.kt` para as flags) — sem script aqui ainda.
-- `whisper-server`: `scripts/build-whisper-server.sh` — clona whisper.cpp,
-  cross-compila pra arm64-v8a com NDK r27c e já deixa os `.so` renomeados
-  (evita colisão com os `libggml*.so` do llama) em `jniLibs/arm64-v8a`.
-- `tsgo.aar`: `scripts/build-tsgo-aar.sh` — `gomobile bind` de
-  `android-tsgo/` depois de qualquer mudança em `tsgo.go`.
+- `scripts/build-llama-static.sh` — cross-compila llama.cpp como libs
+  estáticas (`libllama.a`/`libggml*.a`) pra `android-tsgo/.llama-static/`,
+  consumidas pelas diretivas cgo de `embedding.go`.
+- `scripts/build-whisper-static.sh` — mesma ideia pro whisper.cpp
+  (`android-tsgo/.whisper-static/`), consumidas por `transcription.go`. A
+  parte não-óbvia: whisper.cpp vendora seu próprio fork do ggml, incompatível
+  com o do llama.cpp nessas tags — linkar as duas cópias estáticas no mesmo
+  binário dá erro de símbolo duplicado. O script contorna isso renomeando
+  (`objcopy --redefine-syms`) todo símbolo ggml/gguf que o build do whisper
+  exporta com prefixo `wsp_` antes de gerar os `.a` finais — ver o cabeçalho
+  do próprio script pra motivação completa.
+- `scripts/build-tsgo-aar.sh` — roda os dois scripts acima automaticamente
+  se `.llama-static`/`.whisper-static` ainda não existirem, depois
+  `gomobile bind` de `android-tsgo/` pra gerar o `tsgo.aar` final. Rodar
+  isso depois de qualquer mudança em `tsgo.go`/`embedding.go`/
+  `transcription.go`.
 
-Ambos os scripts esperam `ndk;27.2.12479018` instalado
+Todos os scripts esperam `ndk;27.2.12479018` instalado
 (`sdkmanager --install "ndk;27.2.12479018"`) — mesma versão usada nos
 binários já commitados, pra manter o toolchain consistente.
 

@@ -68,8 +68,8 @@
 
         <!-- Sufficit Transcription IPC contract v1 — see the <permission> declaration above and
              docs/ipc-transcription-contract.md. Same :modelruntime process as
-             ModelRuntimeService/WhisperServerManager so it can read their state in-process; a
-             plain bound service (no startForeground), so it carries none of their
+             ModelRuntimeService/NativeTranscriptionManager so it can read their state
+             in-process; a plain bound service (no startForeground), so it carries none of their
              foregroundServiceType/specialUse requirements. -->
         <service
             android:name=".TranscriptionIpcService"

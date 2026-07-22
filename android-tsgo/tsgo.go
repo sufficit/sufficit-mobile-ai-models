@@ -1,27 +1,20 @@
 // Package tsgo embeds a Tailscale node inside the Sufficit Mobile AI Models Android
 // app via tsnet — a userspace (netstack/gVisor) node, no VpnService/TUN device, no
 // system-wide routing. It joins the tailnet with a preauthkey issued by the Sufficit
-// backend and reverse-proxies inbound tailnet traffic on ModelPort to whichever local
-// model server actually handles the request path — llama-server (embeddings,
-// 127.0.0.1:ModelPort) or whisper-server (transcription, 127.0.0.1:WhisperPort). One
-// external port/API for the backend regardless of which OS process is actually
-// serving it (PLAN: Whisper support). Built as an .aar via `gomobile bind` and
-// consumed from Kotlin.
+// backend and serves inbound tailnet traffic on ModelPort directly: embedding
+// inference (llama.cpp, embedding.go) and transcription inference (whisper.cpp,
+// transcription.go) both run in-process via cgo, no subprocess/reverse-proxy hop —
+// one process, one external port/API for the backend regardless of which model kind
+// answers. Built as an .aar via `gomobile bind` and consumed from Kotlin.
 package tsgo
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
-	"mime"
-	"mime/multipart"
 	"net"
 	"net/http"
-	"net/http/httputil"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -32,16 +25,12 @@ import (
 	"tailscale.com/tsnet"
 )
 
-// ModelPort is the port llama-server listens on locally (embeddings) and the port
-// exposed on the tailnet interface. Matches PHONE_PORT / DeviceModelServerPort
-// convention used by the adb-tethered POC and the backend's TailscaleClientOptions.
+// ModelPort is the port this process listens on locally and the port exposed on the
+// tailnet interface — serves embeddings, transcription, /v1/models and /health all
+// from the one in-process router (buildRouter). Matches PHONE_PORT /
+// DeviceModelServerPort convention used by the adb-tethered POC and the backend's
+// TailscaleClientOptions.
 const ModelPort = 8090
-
-// WhisperPort is the port whisper-server listens on locally (speech-to-text). Not
-// exposed directly on the tailnet — reached through the same external ModelPort via
-// path-based routing in buildRouter, so the backend sees a single OpenAI-compatible
-// API surface no matter which native process actually answers.
-const WhisperPort = 8091
 
 var (
 	mu              sync.Mutex
@@ -378,6 +367,72 @@ func toEmbeddingTestJSON(r embeddingTestResult) string {
 	return string(b)
 }
 
+// LoadTranscriptionModel loads modelPath as the resident in-process transcription model (see
+// transcription.go) — replaces WhisperServerManager.start()/switchTo() from the old
+// subprocess-per-engine architecture. Same cross-process/:sync-only calling requirement as
+// LoadEmbeddingModel — see its doc. Returns "" on success, an error message otherwise.
+func LoadTranscriptionModel(modelPath string) string {
+	if err := loadTranscriptionModel(modelPath); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
+// UnloadTranscriptionModel frees the resident transcription model, if any. Safe to call
+// unconditionally.
+func UnloadTranscriptionModel() {
+	unloadTranscriptionModel()
+}
+
+// TranscriptionModelLoaded reports whether a transcription model is currently resident in this
+// process.
+func TranscriptionModelLoaded() bool {
+	return isTranscriptionModelLoaded()
+}
+
+// transcriptionTestResult mirrors Kotlin's TranscriptionTestResult sealed class shape (see
+// LocalWhisperCliTester.kt) — same reasoning as embeddingTestResult.
+type transcriptionTestResult struct {
+	Success   bool   `json:"success"`
+	Text      string `json:"text,omitempty"`
+	LatencyMs int64  `json:"latencyMs,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// TestTranscription loads modelPath (if not already resident) and runs one transcription over
+// wavBytes, entirely in-process — the local/no-API test button's implementation, mirrors
+// TestEmbedding. LocalWhisperCliTester.kt passes the same synthesized silent WAV
+// LocalTranscriptionTester already used for its API-path smoke test — proving "model loads and
+// answers" doesn't need real speech, same reasoning as TestEmbedding's throwaway "test" string.
+// Safe to call from any process, same as TestEmbedding.
+func TestTranscription(modelPath string, wavBytes []byte) string {
+	start := time.Now()
+	if err := loadTranscriptionModel(modelPath); err != nil {
+		return toTranscriptionTestJSON(transcriptionTestResult{Error: err.Error()})
+	}
+	pcm, err := decodeWAVToPCM16kMono(wavBytes)
+	if err != nil {
+		return toTranscriptionTestJSON(transcriptionTestResult{Error: err.Error()})
+	}
+	result, err := transcribe(pcm, false, "")
+	if err != nil {
+		return toTranscriptionTestJSON(transcriptionTestResult{Error: err.Error()})
+	}
+	return toTranscriptionTestJSON(transcriptionTestResult{
+		Success:   true,
+		Text:      result.Text,
+		LatencyMs: time.Since(start).Milliseconds(),
+	})
+}
+
+func toTranscriptionTestJSON(r transcriptionTestResult) string {
+	b, err := json.Marshal(r)
+	if err != nil {
+		return `{"success":false,"error":"result marshal failed"}`
+	}
+	return string(b)
+}
+
 func toJSON(s Status) string {
 	b, err := json.Marshal(s)
 	if err != nil {
@@ -386,19 +441,17 @@ func toJSON(s Status) string {
 	return string(b)
 }
 
-// buildRouter is the single external API surface the backend talks to: audio
-// transcription requests go to whisper-server, everything else (embeddings,
-// /v1/models, /health) goes to llama-server. Two separate local OS processes, one
-// external port — see package doc.
+// buildRouter is the single external API surface the backend talks to — everything (audio
+// transcription, embeddings, /v1/models, /health) is served in-process now, see package doc.
 func buildRouter() http.Handler {
 	mux := http.NewServeMux()
 	// Registered before the "/v1/audio/" prefix handler below, but order doesn't matter to
 	// ServeMux — it always picks the more specific pattern.
-	mux.Handle("/v1/audio/translations", newWhisperTranslateReverseProxy(WhisperPort))
-	mux.Handle("/v1/audio/", newWhisperReverseProxy(WhisperPort))
-	mux.Handle("/v1/models", newModelsListProxy(ModelPort))
-	// Served natively in-process (embedding.go) instead of reverse-proxying to a spawned
-	// llama-server subprocess — see LoadEmbeddingModel's doc for why.
+	mux.Handle("/v1/audio/translations", newTranslationsHandler())
+	mux.Handle("/v1/audio/", newTranscriptionsHandler())
+	mux.Handle("/v1/models", newModelsListHandler())
+	// Served natively in-process (embedding.go/transcription.go) instead of reverse-proxying to
+	// a spawned subprocess — see LoadEmbeddingModel's doc for why.
 	mux.Handle("/v1/embeddings", newEmbeddingsHandler())
 	mux.Handle("/health", newHealthHandler())
 	// NOT a reverse proxy to 127.0.0.1:ModelPort anymore: this same process now ALSO listens
@@ -434,128 +487,6 @@ func newHealthHandler() http.Handler {
 // (including the backend's own) surfaces as an opaque transport failure with no way
 // to distinguish "phone unreachable" from "phone reachable, nothing loaded yet".
 const noModelBody = `{"error":"no model loaded","status":"idle"}`
-
-type startTimeCtxKey struct{}
-
-// newWhisperReverseProxy is newReverseProxy plus augmentTranscriptionResponse — whisper.cpp's
-// server already speaks a response shape close to sufficit-services-whisper's (the internal
-// FastAPI/faster-whisper deployment this app's transcription endpoint needs to be a drop-in
-// alternative for; see PLAN: Whisper API compatibility), but is missing a handful of fields
-// (model/processing_time/device/server/cached) that service's own responses always include.
-// Adding them here, once, in the proxy layer, means WhisperServerManager and whisper-server
-// itself stay untouched — no native rebuild needed for this.
-func newWhisperReverseProxy(port int) http.Handler {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		originalDirector(r)
-		*r = *r.WithContext(context.WithValue(r.Context(), startTimeCtxKey{}, time.Now()))
-	}
-	proxy.ModifyResponse = augmentTranscriptionResponse
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[tsgo] dial 127.0.0.1:%d failed (no model loaded?): %v", port, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(noModelBody))
-	}
-	return proxy
-}
-
-// augmentTranscriptionResponse injects the extra top-level fields sufficit-services-whisper's
-// responses always carry into whisper-server's native JSON body — left alone for non-JSON
-// response_format values (text/srt/vtt use their own content types) and for anything that
-// isn't a successful transcription result (error bodies, /v1/models docs stubs).
-func augmentTranscriptionResponse(resp *http.Response) error {
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		return nil
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		// Not a JSON object we understand — pass through unchanged rather than fail the request.
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		return nil
-	}
-
-	if _, isTranscription := obj["text"]; isTranscription {
-		transcriptionMetaMu.RLock()
-		obj["model"] = activeModelName
-		obj["server"] = deviceHostname
-		transcriptionMetaMu.RUnlock()
-		obj["device"] = "cpu"
-		obj["cached"] = false
-		if start, ok := resp.Request.Context().Value(startTimeCtxKey{}).(time.Time); ok {
-			obj["processing_time"] = time.Since(start).Seconds()
-		}
-		if wasTranslate, _ := resp.Request.Context().Value(translateCtxKey{}).(bool); wasTranslate {
-			// sufficit-services-whisper always reports the OUTPUT language here for
-			// /v1/audio/translations (translation output is always English) — whisper.cpp's
-			// own "language" field is the DETECTED SOURCE language instead. Override to match;
-			// whisper.cpp's source-language detection (when present, i.e. verbose_json) stays
-			// available under detected_language, same field name the real service uses for it.
-			obj["language"] = "english"
-		}
-	}
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(out))
-	resp.ContentLength = int64(len(out))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
-	return nil
-}
-
-type translateCtxKey struct{}
-
-// maxTranslateRewriteBytes bounds how much of the request body newWhisperTranslateReverseProxy
-// buffers in memory to inject the translate=true field — generous for a voice note/short
-// recording while still bounding worst-case memory use (mirrors the reasoning behind T2.2's
-// body size cap on the embeddings proxy).
-const maxTranslateRewriteBytes = 64 << 20 // 64MB
-
-// newWhisperTranslateReverseProxy makes POST /v1/audio/translations work against
-// whisper-server, which has no such route — whisper.cpp only supports translation via a
-// per-request `translate=true` multipart field on its one configured --inference-path
-// (/v1/audio/transcriptions), not a separate URL like sufficit-services-whisper. Rewrites the
-// destination path and injects that field into the outgoing multipart body; everything else
-// (response augmentation, model/hostname fields, error handling) is identical to
-// newWhisperReverseProxy.
-func newWhisperTranslateReverseProxy(port int) http.Handler {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	originalDirector := proxy.Director
-	proxy.Director = func(r *http.Request) {
-		originalDirector(r)
-		r.URL.Path = "/v1/audio/transcriptions"
-		ctx := context.WithValue(r.Context(), startTimeCtxKey{}, time.Now())
-		ctx = context.WithValue(ctx, translateCtxKey{}, true)
-		*r = *r.WithContext(ctx)
-		if err := injectTranslateField(r); err != nil {
-			log.Printf("[tsgo] /v1/audio/translations: failed to inject translate field, forwarding unmodified: %v", err)
-		}
-	}
-	proxy.ModifyResponse = augmentTranscriptionResponse
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		log.Printf("[tsgo] dial 127.0.0.1:%d failed (no model loaded?): %v", port, err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = w.Write([]byte(noModelBody))
-	}
-	return proxy
-}
 
 // transcriptionModelListEntry is the OpenAI-shaped catalog entry the backend's discovery poll
 // (GET /v1/models — see runtime/Connectors/OpenAI/OpenAIModelFetcher.cs in sufficit-ai) reads.
@@ -619,24 +550,19 @@ func embeddingModelListEntry(e embeddingModelEntry) map[string]any {
 	return entry
 }
 
-// newModelsListProxy makes GET /v1/models list every installed model this device can serve —
-// not just whichever one each engine currently has loaded — alongside whatever llama-server
-// itself reports for the embedding model it's actively running. Plain proxying, like every
-// other non-audio path, would only ever show that one currently-loaded model: llama-server has
-// no idea ModelRegistry has other embedding files sitting on disk, and no idea whisper-server or
-// its TRANSCRIPTION slot exist at all.
-func newModelsListProxy(port int) http.Handler {
-	target := &url.URL{Scheme: "http", Host: "127.0.0.1:" + strconv.Itoa(port)}
-	proxy := httputil.NewSingleHostReverseProxy(target)
-	proxy.ModifyResponse = mergeAdditionalModelsIntoList
-	proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
-		// llama-server isn't dialable — most commonly because whisper is the currently resident
-		// engine (mutual exclusion), so there's no "already in the response" embedding entry to
-		// dedupe against here; list everything installed on both sides. Still worth a 200
-		// rather than the generic noModelBody 503: unlike every other path here, "no embedding
-		// server answering" doesn't mean "nothing this device can do" for a model-list request
-		// specifically, and the backend can't distinguish an empty catalog poll from a dead
-		// device otherwise.
+// newModelsListHandler serves GET /v1/models entirely in-process from installedEmbeddingModels
+// + installedTranscriptionModelNames — replaces newModelsListProxy, which used to reverse-proxy
+// to 127.0.0.1:ModelPort to get llama-server's own live response and merge in whatever it
+// didn't already know about. That target doesn't exist anymore (embedding.go/transcription.go
+// serve in-process; nothing external listens on ModelPort to dial), and dialing it would now
+// just be this exact same process's own local loopback listener answering itself — an infinite
+// self-proxy loop, not a bug this handler can have by construction. installedEmbeddingModels
+// already carries every installed embedding model INCLUDING whichever one is currently loaded
+// (SyncForegroundService pushes the full list unconditionally, with dimensions from
+// DeviceModelCatalog) — there's no longer a separate "live" entry to dedupe against, so this is
+// simpler than the two functions it replaces, not just safer.
+func newModelsListHandler() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		transcriptionMetaMu.RLock()
 		transcriptionNames := installedTranscriptionModelNames
 		embeddings := installedEmbeddingModels
@@ -644,11 +570,11 @@ func newModelsListProxy(port int) http.Handler {
 
 		w.Header().Set("Content-Type", "application/json")
 		if len(transcriptionNames) == 0 && len(embeddings) == 0 {
-			log.Printf("[tsgo] dial 127.0.0.1:%d failed (no model loaded?): %v", port, err)
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(noModelBody))
 			return
 		}
+
 		entries := make([]map[string]any, 0, len(transcriptionNames)+len(embeddings))
 		for _, e := range embeddings {
 			entries = append(entries, embeddingModelListEntry(e))
@@ -656,138 +582,15 @@ func newModelsListProxy(port int) http.Handler {
 		for _, name := range transcriptionNames {
 			entries = append(entries, transcriptionModelListEntry(name))
 		}
-		out, marshalErr := json.Marshal(map[string]any{
+		out, err := json.Marshal(map[string]any{
 			"object": "list",
 			"data":   entries,
 		})
-		if marshalErr != nil {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(noModelBody))
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(out)
-	}
-	return proxy
-}
-
-// mergeAdditionalModelsIntoList appends one catalog entry per installed transcription model
-// (see transcriptionModelListEntry) and per installed embedding model NOT already present in
-// llama-server's real response (see embeddingModelListEntry) — leaving every field of the
-// existing entries untouched. The currently-loaded embedding model is already in there with
-// llama-server's own authoritative id/meta; deduped by id so it doesn't appear twice.
-func mergeAdditionalModelsIntoList(resp *http.Response) error {
-	transcriptionMetaMu.RLock()
-	transcriptionNames := installedTranscriptionModelNames
-	embeddings := installedEmbeddingModels
-	transcriptionMetaMu.RUnlock()
-	if len(transcriptionNames) == 0 && len(embeddings) == 0 {
-		return nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		return nil
-	}
-	if !strings.HasPrefix(resp.Header.Get("Content-Type"), "application/json") {
-		return nil
-	}
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return err
-	}
-	resp.Body.Close()
-
-	var obj map[string]any
-	if err := json.Unmarshal(body, &obj); err != nil {
-		resp.Body = io.NopCloser(bytes.NewReader(body))
-		resp.ContentLength = int64(len(body))
-		return nil
-	}
-
-	data, _ := obj["data"].([]any)
-	existingIDs := make(map[string]bool, len(data))
-	for _, entry := range data {
-		if m, ok := entry.(map[string]any); ok {
-			if id, ok := m["id"].(string); ok {
-				existingIDs[id] = true
-			}
-		}
-	}
-
-	for _, e := range embeddings {
-		if !existingIDs[e.ID] {
-			data = append(data, embeddingModelListEntry(e))
-		}
-	}
-	for _, name := range transcriptionNames {
-		data = append(data, transcriptionModelListEntry(name))
-	}
-	obj["data"] = data
-
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return err
-	}
-	resp.Body = io.NopCloser(bytes.NewReader(out))
-	resp.ContentLength = int64(len(out))
-	resp.Header.Set("Content-Length", strconv.Itoa(len(out)))
-	return nil
-}
-
-// injectTranslateField rewrites r's multipart/form-data body to add a "translate"="true" field,
-// preserving every other part (the audio file, language, prompt, etc.) byte-for-byte. Buffers
-// the whole body — see maxTranslateRewriteBytes — since a reverse proxy can't otherwise inject
-// a field into a body it's meant to stream through unmodified.
-func injectTranslateField(r *http.Request) error {
-	mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	if err != nil || !strings.HasPrefix(mediaType, "multipart/") {
-		return fmt.Errorf("request is not multipart/form-data: %v", err)
-	}
-	boundary, ok := params["boundary"]
-	if !ok {
-		return fmt.Errorf("multipart Content-Type missing boundary")
-	}
-
-	body, err := io.ReadAll(io.LimitReader(r.Body, maxTranslateRewriteBytes+1))
-	if err != nil {
-		return fmt.Errorf("read body: %w", err)
-	}
-	r.Body.Close()
-	if len(body) > maxTranslateRewriteBytes {
-		return fmt.Errorf("body exceeds %d bytes", maxTranslateRewriteBytes)
-	}
-
-	reader := multipart.NewReader(bytes.NewReader(body), boundary)
-	var buf bytes.Buffer
-	writer := multipart.NewWriter(&buf)
-	for {
-		part, err := reader.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			return fmt.Errorf("read part: %w", err)
-		}
-		if part.FormName() == "translate" {
-			continue // caller's own value, if any — ours below is authoritative for this route.
-		}
-		w, err := writer.CreatePart(part.Header)
-		if err != nil {
-			return fmt.Errorf("recreate part %q: %w", part.FormName(), err)
-		}
-		if _, err := io.Copy(w, part); err != nil {
-			return fmt.Errorf("copy part %q: %w", part.FormName(), err)
-		}
-	}
-	if err := writer.WriteField("translate", "true"); err != nil {
-		return fmt.Errorf("write translate field: %w", err)
-	}
-	if err := writer.Close(); err != nil {
-		return fmt.Errorf("close multipart writer: %w", err)
-	}
-
-	r.Body = io.NopCloser(&buf)
-	r.ContentLength = int64(buf.Len())
-	r.Header.Set("Content-Type", writer.FormDataContentType())
-	return nil
+	})
 }

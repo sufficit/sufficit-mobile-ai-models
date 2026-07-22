@@ -114,6 +114,19 @@ class SyncForegroundService : Service() {
                     }
                 }
 
+                // Same story as embeddingPath above, transcription's counterpart — the actual
+                // whisper.cpp model load/unload happens here, in the process running tsgo's HTTP
+                // server (see NativeTranscriptionManager's kdoc).
+                val transcriptionPath = intent.getStringExtra(ModelRuntimeService.EXTRA_TRANSCRIPTION_MODEL_PATH)
+                if (transcriptionPath.isNullOrEmpty()) {
+                    tsgo.Tsgo.unloadTranscriptionModel()
+                } else {
+                    val loadError = tsgo.Tsgo.loadTranscriptionModel(transcriptionPath)
+                    if (loadError.isNotEmpty()) {
+                        android.util.Log.e("SyncForegroundService", "loadTranscriptionModel(\"$transcriptionPath\") failed: $loadError")
+                    }
+                }
+
                 // Every installed Whisper model should be discoverable (GET /v1/models), not
                 // just whichever one is currently selected — a device commonly has more than
                 // one downloaded at once. installedModels() is a plain filesystem scan, safe to
