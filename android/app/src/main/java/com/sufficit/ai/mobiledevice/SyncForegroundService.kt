@@ -23,6 +23,8 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.File
 
 /**
@@ -49,6 +51,10 @@ import java.io.File
 class SyncForegroundService : Service() {
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    // The heartbeat loop, ACTION_SYNC_NOW and ConnectivityManager callback can all fire at
+    // startup. Serialize them because tsgo.Start() owns process-global Go state and rejects a
+    // concurrent second start, leaving the device announced but without a usable tailnet IP.
+    private val syncMutex = Mutex()
     private var loopJob: Job? = null
 
     private lateinit var store: PairingStore
@@ -207,8 +213,8 @@ class SyncForegroundService : Service() {
         }
     }
 
-    private suspend fun syncOnce() {
-        if (!store.isPaired()) return
+    private suspend fun syncOnce() = syncMutex.withLock {
+        if (!store.isPaired()) return@withLock
         val result = performSync(store, api, oauth, tailscale)
         val message = when (result) {
             is AnnounceResult.Success -> getString(R.string.sync_success)
