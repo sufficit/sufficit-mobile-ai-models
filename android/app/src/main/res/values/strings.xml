@@ -17,8 +17,8 @@
 
     <!-- TokenPairingScreen -->
     <string name="token_pairing_title">Parear com token</string>
-    <string name="token_pairing_subtitle">Cole o token gerado em /ai/mobile-devices. Uso avançado — prefira \"Entrar com Sufficit\" na tela anterior quando possível.</string>
-    <string name="token_pairing_label">Pairing token</string>
+    <string name="token_pairing_subtitle">Cole o token criado em Dispositivos móveis no Sufficit AI. Essa opção é ideal para aparelhos sem uma conta Google configurada.</string>
+    <string name="token_pairing_label">Token de pareamento</string>
     <string name="token_pairing_button">Parear com token</string>
 
     <!-- HomeScreen -->

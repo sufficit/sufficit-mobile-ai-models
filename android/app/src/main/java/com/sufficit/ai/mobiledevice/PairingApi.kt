@@ -50,7 +50,9 @@ sealed class AnnounceResult {
  * Talks to the device gateway added by
  * docs/PLAN-202607091200-mobile-device-ai-provider.md in sufficit-ai. Two
  * pairing modes, same underlying upsert on the server side:
- *  - Modo A: [announce] — POST {gatewayBaseUrl}/mobile/{token}/announce
+ *  - Modo A: [announce] — POST {gatewayBaseUrl}/api/ai/mobile-devices/pairing/announce,
+ *    authenticated with `Authorization: Sufficit-Pairing <token>` so the
+ *    credential never leaks through URLs or request logs.
  *  - Modo B: [selfAnnounce] — POST {gatewayBaseUrl}/api/ai/mobile-devices/self-announce,
  *    authenticated with the user's own OAuth Bearer token instead of a
  *    copy/pasted token.
@@ -92,8 +94,12 @@ class PairingApi(
         appVersion: String
     ): AnnounceResult {
         val body = announceBody(deviceName, deviceModel, appVersion)
-        val url = gatewayBaseUrl.trimEnd('/') + "/mobile/$token/announce"
-        val request = Request.Builder().url(url).post(body).build()
+        val url = gatewayBaseUrl.trimEnd('/') + "/api/ai/mobile-devices/pairing/announce"
+        val request = Request.Builder()
+            .url(url)
+            .header("Authorization", "Sufficit-Pairing $token")
+            .post(body)
+            .build()
         return execute(request)
     }
 

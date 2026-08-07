@@ -3,6 +3,7 @@ package com.sufficit.ai.mobiledevice
 import android.os.Build
 import android.os.Process
 import android.util.Log
+import net.openid.appauth.AuthorizationException
 
 /** Refresh proactively this long before actual expiry — clock skew + request latency buffer. */
 private const val TOKEN_EXPIRY_BUFFER_MS = 60_000L
@@ -111,6 +112,18 @@ private suspend fun ensureFreshAccessToken(store: PairingStore, oauth: OAuthMana
         // Some IdPs rotate the refresh token on use, some don't — only overwrite if a new one came back.
         response.refreshToken?.let { store.oauthRefreshToken = it }
         newAccessToken
+    } catch (ex: AuthorizationException) {
+        if (ex.type == AuthorizationException.TYPE_OAUTH_TOKEN_ERROR && ex.error == "invalid_grant") {
+            // A revoked, expired or already-rotated refresh token cannot recover
+            // by retrying. Clear only the OAuth session so the UI asks for a
+            // fresh login and the foreground sync loop stops hammering /token.
+            Log.w("SyncLogic", "refresh token is no longer valid; clearing OAuth session")
+            store.clearOAuthSession()
+            null
+        } else {
+            Log.w("SyncLogic", "token refresh failed, trying stale token", ex)
+            accessToken
+        }
     } catch (ex: Exception) {
         Log.w("SyncLogic", "token refresh failed, trying stale token", ex)
         accessToken

@@ -26,14 +26,15 @@ import kotlin.coroutines.resumeWithException
  * Client registered directly in the identity database (2026-07-09):
  * client_id=sufficit_mobile_ai_models, public client (no secret), PKCE
  * required, redirect sufficitmobileaimodels://callback, scopes
- * openid+profile+email+offline_access (refresh token so the app doesn't
- * need to re-prompt login on every heartbeat).
+ * openid+profile+email+offline_access+directives (refresh token so the app
+ * doesn't need to re-prompt login on every heartbeat, plus the user's
+ * authorization directives required by the self-announce endpoint).
  */
 object OAuthConfig {
     const val ISSUER = "https://identity.sufficit.com.br"
     const val CLIENT_ID = "sufficit_mobile_ai_models"
     const val REDIRECT_URI = "sufficitmobileaimodels://callback"
-    val SCOPES = listOf("openid", "profile", "email", "offline_access")
+    val SCOPES = listOf("openid", "profile", "email", "offline_access", "directives")
 }
 
 data class SufficitUserInfo(

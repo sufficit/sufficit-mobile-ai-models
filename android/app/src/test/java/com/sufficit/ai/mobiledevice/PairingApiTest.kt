@@ -56,6 +56,8 @@ class PairingApiTest {
         assertEquals("dev", payload.getString("deviceName"))
         assertEquals("Samsung SM-A515F", payload.getString("deviceModel"))
         assertEquals("0.4.1 (5)", payload.getString("appVersion"))
+        assertEquals("/api/ai/mobile-devices/pairing/announce", request.path)
+        assertEquals("Sufficit-Pairing tok", request.getHeader("Authorization"))
     }
 
     @Test
