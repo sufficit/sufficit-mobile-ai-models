@@ -7,8 +7,7 @@ package tsgo
 // tooling build and run without the android-arm64-only static libs from
 // scripts/build-llama-static.sh (see embedding.go's doc). The real implementation only exists
 // under the "android" build tag, matching the same portable-stub pattern this codebase already
-// uses for netmon's platform-specific interface enumeration (see the upstream tailscale.com
-// package this app depends on).
+// uses for platform-specific native inference implementations.
 
 import "fmt"
 

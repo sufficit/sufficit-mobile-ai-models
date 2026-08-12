@@ -41,14 +41,7 @@ export PATH="$PATH:$(go env GOPATH)/bin"
 export ANDROID_HOME="${ANDROID_HOME:?set ANDROID_HOME}"
 export ANDROID_NDK_HOME
 
-# ts_omit_portmapper: excludes NAT-PMP/PCP/UPnP port mapping (tailscale.com/feature/portmapper,
-# pulled in via github.com/huin/goupnp) entirely. UPnP discovery calls raw net.Interfaces()
-# directly, bypassing our SetInterfacesJSON/netmon.RegisterInterfaceGetter override (that only
-# covers tailscale's own netmon package) — a real, SELinux-blocked call site on Android, just
-# not the one that caused the tailnet-never-connects bug investigated in tsgo.go's
-# SetInterfacesJSON (that was netmon's own %zone CIDR-parsing fallback). Kept as defensive
-# hardening: portmapper is purely a direct-connection optimization — DERP relay + STUN-based
-# hole punching still work without it — so omitting it trades a minor optimization for one
-# less raw-netlink call site on devices with strict untrusted_app SELinux policies.
-gomobile bind -target=android/arm64 -androidapi 28 -tags ts_omit_portmapper -o "$OUT" .
+# O AAR contém apenas inferência e o listener HTTP. WireGuard/Headscale pertencem ao
+# sufficit-mobile-vpn, portanto não há build tag nem dependência Tailscale neste módulo.
+gomobile bind -target=android/arm64 -androidapi 28 -o "$OUT" .
 echo "Wrote $OUT"

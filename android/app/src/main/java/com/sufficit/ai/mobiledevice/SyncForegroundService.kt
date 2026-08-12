@@ -12,6 +12,7 @@ import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.Network
 import android.os.BatteryManager
+import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
@@ -25,7 +26,6 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
-import java.io.File
 
 /**
  * Background heartbeat — PLAN Fase 4 "heartbeat com política de bateria".
@@ -42,11 +42,12 @@ import java.io.File
  * if model loading/downloading crashes; splitting them into two processes is the only way
  * Android actually guarantees a crash in one can't take the other down.
  *
- * Started once the device is paired (Home screen), stopped on logout.
+ * Started with the app/boot so the local inference endpoint remains available independently
+ * of cloud pairing. Pairing controls only announce/heartbeat.
  *
  * Single owner of [performSync] (fix for the two-processes-syncing bug — see PLAN T1.1):
  * the UI process only sends [ACTION_SYNC_NOW]/[ACTION_LOGOUT] and listens for
- * [ACTION_SYNC_STATE]; it never calls [performSync] or touches [TailscaleManager] itself.
+ * [ACTION_SYNC_STATE]; it never calls [performSync] or controls the VPN itself.
  */
 class SyncForegroundService : Service() {
 
@@ -60,7 +61,7 @@ class SyncForegroundService : Service() {
     private lateinit var store: PairingStore
     private lateinit var api: PairingApi
     private lateinit var oauth: OAuthManager
-    private lateinit var tailscale: TailscaleManager
+    private lateinit var vpn: SufficitVpnClient
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var modelStatusReceiver: BroadcastReceiver? = null
@@ -71,20 +72,18 @@ class SyncForegroundService : Service() {
         store = PairingStore(applicationContext)
         api = PairingApi()
         oauth = OAuthManager(applicationContext)
-        tailscale = TailscaleManager(applicationContext)
+        vpn = SufficitVpnClient(applicationContext)
+        val inferenceStatus = tsgo.Tsgo.start(Build.MODEL ?: "android-device")
+        android.util.Log.i("SyncForegroundService", "inference listener: $inferenceStatus")
 
-        // tsnet snapshots interfaces once at Start() (SetInterfacesJSON) — a WiFi<->4G switch
-        // or any other network change leaves it stuck with a stale list until the process dies
-        // (PLAN T3.3). Drop the session here so the next syncOnce() reconnects with fresh ones.
+        // Mudanças Wi-Fi/4G são tratadas pelo VpnService compartilhado. Este processo apenas
+        // refaz o heartbeat; o listener/modelo não é mais derrubado em cada troca de rede.
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         networkCallback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
                 // Also fires on this service's initial startup — syncOnce() is idempotent, no
                 // harm done.
-                scope.launch {
-                    if (tailscale.isRunning()) tailscale.stop()
-                    syncOnce()
-                }
+                scope.launch { syncOnce() }
             }
         }
         connectivityManager?.registerDefaultNetworkCallback(networkCallback!!)
@@ -180,6 +179,11 @@ class SyncForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIFICATION_ID, buildNotification())
+        scope.launch {
+            if (vpn.connectAndPublish(null)) {
+                android.util.Log.i("SyncForegroundService", "8090 published through Sufficit VPN")
+            }
+        }
         ModelRuntimeService.start(applicationContext)
         // Forces an immediate ACTION_STATUS_CHANGED broadcast rather than waiting for
         // ModelRuntimeService's own keep-alive loop to get around to one — this process needs
@@ -191,8 +195,9 @@ class SyncForegroundService : Service() {
             ACTION_LOGOUT -> {
                 loopJob?.cancel()
                 scope.launch {
-                    tailscale.stop()
-                    File(filesDir, "tsgo-state").deleteRecursively()
+                    vpn.unregisterLocalService()
+                    vpn.close()
+                    tsgo.Tsgo.stop()
                     stopSelf()
                 }
                 return START_NOT_STICKY
@@ -215,7 +220,7 @@ class SyncForegroundService : Service() {
 
     private suspend fun syncOnce() = syncMutex.withLock {
         if (!store.isPaired()) return@withLock
-        val result = performSync(store, api, oauth, tailscale)
+        val result = performSync(store, api, oauth, vpn)
         val message = when (result) {
             is AnnounceResult.Success -> getString(R.string.sync_success)
             is AnnounceResult.Failure -> getString(R.string.sync_failure, result.message)
@@ -225,7 +230,7 @@ class SyncForegroundService : Service() {
             Intent(ACTION_SYNC_STATE).setPackage(packageName)
                 .putExtra(EXTRA_SYNC_SUCCESS, result is AnnounceResult.Success)
                 .putExtra(EXTRA_SYNC_MESSAGE, message)
-                .putExtra(EXTRA_TAILNET_IP, tailscale.tailnetIp())
+                .putExtra(EXTRA_TAILNET_IP, vpn.vpnIpv4())
                 .putExtra(EXTRA_LAST_SYNC_AT_MS, System.currentTimeMillis())
         )
     }
@@ -235,8 +240,8 @@ class SyncForegroundService : Service() {
         modelStatusReceiver?.let { unregisterReceiver(it) }
         scope.cancel()
         oauth.dispose()
-        // The tsnet node must never outlive this service — it's the sole owner (PLAN T1.1).
-        tailscale.stop()
+        vpn.close()
+        tsgo.Tsgo.stop()
         super.onDestroy()
     }
 

@@ -24,7 +24,7 @@ suspend fun performSync(
     store: PairingStore,
     api: PairingApi,
     oauth: OAuthManager,
-    tailscale: TailscaleManager
+    vpn: SufficitVpnClient
 ): AnnounceResult {
     val pairingToken = store.pairingToken
     val accessToken = ensureFreshAccessToken(store, oauth)
@@ -53,7 +53,7 @@ suspend fun performSync(
     }
 
     if (result is AnnounceResult.Success) {
-        ensureTailnetConnected(store, tailscale, result)
+        ensureVpnConnected(store, vpn, result)
     }
 
     return result
@@ -130,32 +130,15 @@ private suspend fun ensureFreshAccessToken(store: PairingStore, oauth: OAuthMana
     }
 }
 
-/**
- * Ensures tsnet has a *live* session in this process — not just that the node is registered
- * server-side. These are different things: once a device has joined once, the backend
- * recognizes it by node name and stops handing out fresh preauthkeys (TailnetJoinKey comes
- * back null), but that tells us nothing about whether *this run* of the app has actually
- * called tsgo.Start() yet. A naive "only join once, ever" check leaves every subsequent
- * app/process restart permanently disconnected — the backend sees a registered-but-never-
- * reconnected node.
- *
- * So: always check [TailscaleManager.isRunning] first. If already running, nothing to do.
- * Otherwise start — with the fresh preauthkey when the backend provided one (first-ever
- * join), or with an empty authKey otherwise (resume from tsnet's own persisted node identity
- * under stateDir, which is how a previously-registered node reconnects without a new key).
- */
-private fun ensureTailnetConnected(store: PairingStore, tailscale: TailscaleManager, result: AnnounceResult.Success) {
-    val loginServer = result.tailnetLoginServer ?: return
-    val nodeName = result.tailnetNodeName ?: return
-
-    store.tailnetLoginServer = loginServer
-    store.tailnetNodeName = nodeName
-
-    if (tailscale.isRunning()) return
-
-    val authKey = result.tailnetJoinKey ?: ""
-    val statusJson = tailscale.start(loginServer, authKey, nodeName)
-    if (!statusJson.contains("\"tailnetIp\":\"") || statusJson.contains("\"tailnetIp\":\"\"")) {
-        Log.w("SyncLogic", "tailnet (re)connect did not produce an IP: $statusJson")
+/** Entrega o envelope opaco ao agente VPN e publica o listener local já iniciado. */
+private suspend fun ensureVpnConnected(
+    store: PairingStore,
+    vpn: SufficitVpnClient,
+    result: AnnounceResult.Success
+) {
+    result.tailnetLoginServer?.let { store.tailnetLoginServer = it }
+    result.tailnetNodeName?.let { store.tailnetNodeName = it }
+    if (!vpn.connectAndPublish(result.vpnEnrollment)) {
+        Log.w("SyncLogic", "Sufficit VPN indisponível; API local segue ativa em 8090")
     }
 }

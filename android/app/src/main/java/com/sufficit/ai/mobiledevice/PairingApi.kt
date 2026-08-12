@@ -30,7 +30,8 @@ private object Ipv4OnlyDns : Dns {
 
 sealed class AnnounceResult {
     /**
-     * [tailnetJoinKey]/[tailnetLoginServer]/[tailnetNodeName] mirror
+     * [vpnEnrollment] é o envelope opaco emitido pelo Network Control. Os campos
+     * tailnet* permanecem apenas durante a transição de versões do backend.
      * AIMobileDeviceAnnounceResult on the backend (see
      * AIAdminRuntime.MobileDevices.cs): server-assigned, never sent by this
      * client. [tailnetJoinKey] is only present while the device hasn't joined
@@ -38,6 +39,7 @@ sealed class AnnounceResult {
      */
     data class Success(
         val providerId: String,
+        val vpnEnrollment: String? = null,
         val tailnetJoinKey: String? = null,
         val tailnetLoginServer: String? = null,
         val tailnetNodeName: String? = null
@@ -147,6 +149,7 @@ class PairingApi(
             val json = JSONObject(text)
             AnnounceResult.Success(
                 providerId = json.optString("providerId"),
+                vpnEnrollment = json.optStringOrNull("vpnEnrollment"),
                 tailnetJoinKey = json.optStringOrNull("tailnetJoinKey"),
                 tailnetLoginServer = json.optStringOrNull("tailnetLoginServer"),
                 tailnetNodeName = json.optStringOrNull("tailnetNodeName")

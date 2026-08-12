@@ -104,9 +104,12 @@ class MainActivity : ComponentActivity() {
         oauth = OAuthManager(applicationContext)
 
         val startDestination = if (store.isPaired()) Routes.HOME else Routes.LOGIN
-        if (store.isPaired()) {
-            SyncForegroundService.start(applicationContext)
-        }
+
+        // A inferência local e sua publicação na VPN pertencem ao dispositivo, não à sessão
+        // Sufficit. O pareamento só habilita announce/heartbeat na nuvem; 8090 deve continuar
+        // disponível mesmo antes do login ou enquanto uma credencial é renovada.
+        SufficitVpnClient.requestConsent(this)
+        SyncForegroundService.start(applicationContext)
 
         setContent {
             SufficitTheme {

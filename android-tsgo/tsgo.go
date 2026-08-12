@@ -1,28 +1,18 @@
-// Package tsgo embeds a Tailscale node inside the Sufficit Mobile AI Models Android
-// app via tsnet — a userspace (netstack/gVisor) node, no VpnService/TUN device, no
-// system-wide routing. It joins the tailnet with a preauthkey issued by the Sufficit
-// backend and serves inbound tailnet traffic on ModelPort directly: embedding
-// inference (llama.cpp, embedding.go) and transcription inference (whisper.cpp,
-// transcription.go) both run in-process via cgo, no subprocess/reverse-proxy hop —
-// one process, one external port/API for the backend regardless of which model kind
-// answers. Built as an .aar via `gomobile bind` and consumed from Kotlin.
+// Package tsgo hosts the on-device OpenAI-compatible inference API. Networking is
+// deliberately outside this package: sufficit-mobile-vpn owns the only Android
+// VpnService and routes the device VPN address to this process' TCP listener.
 package tsgo
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"tailscale.com/net/netmon"
-	"tailscale.com/tsnet"
 )
 
 // ModelPort is the port this process listens on locally and the port exposed on the
@@ -33,10 +23,8 @@ import (
 const ModelPort = 8090
 
 var (
-	mu              sync.Mutex
-	server          *tsnet.Server
-	httpServer      *http.Server
-	localHTTPServer *http.Server
+	mu         sync.Mutex
+	httpServer *http.Server
 
 	transcriptionMetaMu              sync.RWMutex
 	activeModelName                  string
@@ -47,123 +35,23 @@ var (
 // Status is returned by Status() as JSON — gomobile can't export structs directly,
 // only primitive types, so the Kotlin side deserializes this string.
 type Status struct {
-	Running   bool   `json:"running"`
-	TailnetIP string `json:"tailnetIp"`
-	Hostname  string `json:"hostname"`
-	Error     string `json:"error,omitempty"`
+	Running  bool   `json:"running"`
+	Hostname string `json:"hostname"`
+	Error    string `json:"error,omitempty"`
 }
 
-// androidInterface mirrors what the Kotlin side can read from
-// java.net.NetworkInterface — Go on Android can't enumerate interfaces itself
-// (net.Interfaces() needs a netlink socket, blocked by SELinux for regular apps:
-// "route ip+net: netlinkrib: permission denied"). The Kotlin side collects this
-// via the standard Java API (which Android itself permits) and calls
-// SetInterfacesJSON before Start().
-type androidInterface struct {
-	Name  string   `json:"name"`
-	Index int      `json:"index"`
-	MTU   int      `json:"mtu"`
-	Flags int      `json:"flags"` // net.Flags bitmask: Up=1, Broadcast=2, Loopback=4, PointToPoint=8, Multicast=16
-	Addrs []string `json:"addrs"` // CIDR strings, e.g. "192.168.1.5/24"
-}
-
-// SetInterfacesJSON registers the device's network interfaces (collected on the
-// Kotlin side via java.net.NetworkInterface) with tsnet's netmon so it can pick a
-// source address and build magicsock without needing raw netlink access. Must be
-// called before Start().
-func SetInterfacesJSON(jsonStr string) string {
-	var raw []androidInterface
-	if err := json.Unmarshal([]byte(jsonStr), &raw); err != nil {
-		return fmt.Sprintf("parse: %v", err)
-	}
-
-	list := make([]netmon.Interface, 0, len(raw))
-	for _, r := range raw {
-		ni := &net.Interface{
-			Index: r.Index,
-			MTU:   r.MTU,
-			Name:  r.Name,
-			Flags: net.Flags(r.Flags),
-		}
-		// Non-nil (even if it ends up empty): netmon.Interface.Addrs() only uses AltAddrs
-		// when it's non-nil, falling back to the real net.Interface.Addrs() otherwise — which
-		// hits the exact raw netlink syscall this whole file exists to avoid, fatally, deep
-		// inside tsnet.Server.Listen() (SELinux denies it for untrusted_app on some devices).
-		// An interface reported with zero parseable addresses must still short-circuit to
-		// "no addresses" rather than silently falling through to that blocked path.
-		addrs := []net.Addr{}
-		for _, a := range r.Addrs {
-			// net.ParseCIDR rejects the "%zone" suffix Android reports on IPv6 link-local
-			// addresses (e.g. "fe80::1%wlan0/64") — strip it before parsing. Observed on a
-			// real device: "dummy0"'s only address is a zone-suffixed link-local IPv6, so
-			// without this its addresses would all fail to parse and hit the fallback above.
-			addr := a
-			if pct := strings.IndexByte(addr, '%'); pct != -1 {
-				if slash := strings.IndexByte(addr[pct:], '/'); slash != -1 {
-					addr = addr[:pct] + addr[pct+slash:]
-				} else {
-					addr = addr[:pct]
-				}
-			}
-			if ip, ipnet, err := net.ParseCIDR(addr); err == nil {
-				ipnet.IP = ip
-				addrs = append(addrs, ipnet)
-			}
-		}
-		list = append(list, netmon.Interface{Interface: ni, AltAddrs: addrs})
-	}
-
-	netmon.RegisterInterfaceGetter(func() ([]netmon.Interface, error) {
-		return list, nil
-	})
-	return ""
-}
-
-// Start joins the tailnet and begins proxying ModelPort. controlURL is the
-// Headscale login-server URL, authKey is a preauthkey minted by the backend
-// (POST /mobile/{token}/announce or /api/ai/mobile-devices/self-announce),
-// hostname must match what the backend expects back (AIMobileDeviceAnnounceResult.
-// TailnetNodeName) so future announces can resolve this node's IP, and stateDir is
-// an app-writable directory (Android Context.getFilesDir()) tsnet persists its
-// node identity/keys in — reusing the same stateDir across restarts avoids
-// re-registering as a new node every time the app restarts.
-func Start(controlURL, authKey, hostname, stateDir string) string {
+// Start exposes the inference router on every local interface. Binding 0.0.0.0 is
+// intentional: Android's VpnService owns the VPN interface and the Headscale ACL limits
+// remote reachability to authorized peers. Loopback callers continue to use 127.0.0.1:8090.
+func Start(hostname string) string {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if server != nil {
-		return toJSON(Status{Error: "already started; call Stop() first"})
+	if httpServer != nil {
+		return currentStatusLocked()
 	}
 
-	// Android apps have no $HOME, no working directory (Getwd returns "/"), and no
-	// os.UserCacheDir() support — tailscale's logpolicy walks all three looking for
-	// somewhere to persist log state and, finding nothing, falls back to
-	// os.MkdirTemp("", ...), which needs $TMPDIR set (there's no global /tmp on
-	// Android). Without this it panics: "no safe place found to store log state".
-	tmpDir := stateDir + "/tmp"
-	os.MkdirAll(tmpDir, 0700)
-	os.Setenv("TMPDIR", tmpDir)
-
-	// gomobile bind's stdlib log output doesn't reach logcat at all (confirmed: zero
-	// "[tsnet]"-tagged lines ever appear, even benign startup messages) — redirect to a
-	// plain file instead, retrievable via `adb shell run-as <pkg> --user <id> cat
-	// files/tsgo-state/tsgo-debug.log`. This is how the netlink/SELinux root cause of the
-	// tailnet-never-connects bug on some devices was actually found.
-	if logFile, err := os.OpenFile(stateDir+"/tsgo-debug.log", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600); err == nil {
-		log.SetOutput(logFile)
-	}
-	log.Printf("Start() called: controlURL=%s hostname=%s stateDir=%s", controlURL, hostname, stateDir)
-
-	s := &tsnet.Server{
-		Dir:        stateDir,
-		Hostname:   hostname,
-		ControlURL: controlURL,
-		AuthKey:    authKey,
-		Ephemeral:  false,
-		Logf:       func(format string, args ...any) { log.Printf("[tsnet] "+format, args...) },
-	}
-
-	ln, err := s.Listen("tcp", ":"+strconv.Itoa(ModelPort))
+	ln, err := net.Listen("tcp", "0.0.0.0:"+strconv.Itoa(ModelPort))
 	if err != nil {
 		return toJSON(Status{Error: fmt.Sprintf("listen: %v", err)})
 	}
@@ -172,41 +60,21 @@ func Start(controlURL, authKey, hostname, stateDir string) string {
 	deviceHostname = hostname
 	transcriptionMetaMu.Unlock()
 
-	server = s
 	router := buildRouter()
 	httpServer = &http.Server{Handler: router}
+	server := httpServer
 
 	go func() {
-		if err := httpServer.Serve(ln); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(ln); err != nil && err != http.ErrServerClosed {
 			log.Printf("[tsgo] http serve error: %v", err)
 		}
 	}()
-
-	// Second, real (not tsnet-virtual) listener on loopback, same handler. Needed now that
-	// embedding inference moved in-process into this same Go runtime (see embedding.go /
-	// LoadEmbeddingModel's doc): this process (:sync) is the only one with a resident model,
-	// so ModelRuntimeService's local test buttons (:modelruntime, LocalEmbeddingTester —
-	// unlike LocalEmbeddingCliTester, which now calls TestEmbedding directly, no HTTP) need an
-	// actual loopback socket to hit, not just the tsnet-virtual one only reachable from other
-	// tailnet nodes. Harmless to also have this when nothing's testing: same 503 "no model
-	// loaded" behavior as the tailnet-facing listener when nothing's resident.
-	localLn, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(ModelPort))
-	if err != nil {
-		log.Printf("[tsgo] local loopback listen failed (local test buttons won't work, tailnet-facing serving is unaffected): %v", err)
-	} else {
-		log.Printf("[tsgo] local loopback listener up on 127.0.0.1:%d", ModelPort)
-		localHTTPServer = &http.Server{Handler: router}
-		go func() {
-			if err := localHTTPServer.Serve(localLn); err != nil && err != http.ErrServerClosed {
-				log.Printf("[tsgo] local http serve error: %v", err)
-			}
-		}()
-	}
+	log.Printf("[tsgo] inference API listening on 0.0.0.0:%d", ModelPort)
 
 	return currentStatusLocked()
 }
 
-// Stop tears down the tailnet connection and stops proxying.
+// Stop closes only the inference listener. The shared VPN remains available to other apps.
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
@@ -214,14 +82,6 @@ func Stop() {
 	if httpServer != nil {
 		_ = httpServer.Close()
 		httpServer = nil
-	}
-	if localHTTPServer != nil {
-		_ = localHTTPServer.Close()
-		localHTTPServer = nil
-	}
-	if server != nil {
-		_ = server.Close()
-		server = nil
 	}
 }
 
@@ -233,22 +93,10 @@ func StatusJSON() string {
 }
 
 func currentStatusLocked() string {
-	if server == nil {
+	if httpServer == nil {
 		return toJSON(Status{Running: false})
 	}
-
-	status := Status{Running: true, Hostname: server.Hostname}
-	if lc, err := server.LocalClient(); err == nil {
-		if st, err := lc.StatusWithoutPeers(context.Background()); err == nil && st.Self != nil {
-			for _, ip := range st.Self.TailscaleIPs {
-				if ip.Is4() {
-					status.TailnetIP = ip.String()
-					break
-				}
-			}
-		}
-	}
-	return toJSON(status)
+	return toJSON(Status{Running: true, Hostname: deviceHostname})
 }
 
 // SetActiveTranscriptionModel records which whisper.cpp model file is the device's configured
@@ -256,8 +104,7 @@ func currentStatusLocked() string {
 // to ModelRuntimeService's ACTION_STATUS_CHANGED broadcast — not by WhisperServerManager
 // directly, even though it's the piece that actually knows which model just started. Reason:
 // tsgo's Go globals are per-OS-process, and WhisperServerManager runs in :modelruntime while
-// the tsnet/HTTP proxy that reads activeModelName runs in :sync (started via
-// TailscaleManager.start in SyncForegroundService) — two separate processes, two separate
+// the HTTP API that reads activeModelName runs in :sync — two separate processes, two separate
 // copies of every Go global, no shared memory. A call from :modelruntime's copy of this
 // function would silently set a value nothing ever reads. SyncForegroundService also queries
 // ModelRuntimeService for the current status once at its own startup (not just reactively),
@@ -302,7 +149,7 @@ func SetInstalledTranscriptionModels(namesJSON string) {
 // embedding.go) — replaces LlamaServerManager.start()/switchTo() from the old
 // subprocess-per-engine architecture. Must be called from :sync, same cross-process reasoning
 // as SetActiveTranscriptionModel: the HTTP server that actually serves /v1/embeddings
-// (buildRouter, started via Start() from TailscaleManager/SyncForegroundService) runs in :sync,
+// (buildRouter, started by SyncForegroundService) runs in :sync,
 // and Go globals — including the loaded llama_context this holds onto — don't cross process
 // boundaries. A call made from :modelruntime would load a model into a copy of this package
 // nothing ever serves requests from. Returns "" on success, an error message otherwise.
@@ -454,8 +301,8 @@ func buildRouter() http.Handler {
 	// a spawned subprocess — see LoadEmbeddingModel's doc for why.
 	mux.Handle("/v1/embeddings", newEmbeddingsHandler())
 	mux.Handle("/health", newHealthHandler())
-	// NOT a reverse proxy to 127.0.0.1:ModelPort anymore: this same process now ALSO listens
-	// on that exact address (Start()'s localHTTPServer, for local test buttons) — proxying
+	// NOT a reverse proxy to 127.0.0.1:ModelPort: this same process listens
+	// on all local interfaces (including loopback) — proxying
 	// there from inside the process already serving it would just be a pointless self-loop.
 	// Was only ever needed for llama-server routes this app doesn't use (chat/completions
 	// etc.) now that /v1/embeddings and /v1/models are handled explicitly above; anything
@@ -468,7 +315,7 @@ func buildRouter() http.Handler {
 	return mux
 }
 
-// newHealthHandler reports this device as healthy whenever the tsnet node itself is up and
+// newHealthHandler reports this device as healthy whenever the inference listener is up and
 // serving — matching the old llama-server subprocess's /health semantics (which only ever
 // confirmed "the process answers HTTP", not "a model happens to be loaded"; an idle/no-model
 // device is still a healthy device, just one with nothing to dispatch to right now).
