@@ -442,6 +442,13 @@ private fun RecommendedModelCard(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                known.details?.let { details ->
+                    Text(
+                        details,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
             }
             when {
                 alreadyInstalled -> Icon(Icons.Filled.CheckCircle, contentDescription = stringResource(R.string.models_already_installed), tint = MaterialTheme.colorScheme.primary)

@@ -8,11 +8,14 @@ package tsgo
 // WAV decoder rather than a vendored C library, kept portable (no build tag, no cgo) so it's
 // exercised by `go test ./...` on the host same as everything else in this file.
 //
-// Handles standard PCM (audioFormat 1), IEEE float (3), and WAVE_FORMAT_EXTENSIBLE (0xFFFE,
-// common from Windows recorders) at 8/16/24/32-bit depths, any channel count (downmixed to mono
-// by averaging) and any sample rate (linearly resampled to 16kHz) — broader than the 16kHz
-// mono 16-bit contract callers are asked to produce, so slightly-off real-world recordings still
-// work rather than failing outright.
+// Handles standard PCM (audioFormat 1), G.711 A-law (6), G.711 mu-law (7), IEEE float (3), and
+// WAVE_FORMAT_EXTENSIBLE (0xFFFE, common from Windows recorders). PCM accepts
+// 8/16/24/32-bit depths, IEEE float accepts 32-bit, and G.711 accepts its standard 8-bit
+// representation. Any channel count is
+// downmixed to mono and any sample rate is linearly resampled to 16kHz. Supporting G.711 in the
+// WAV container matters for asynchronous telephone-call recordings, where 8kHz A-law/mu-law is
+// common and forcing every client to transcode would make the otherwise provider-agnostic API
+// unnecessarily fragile.
 
 import (
 	"encoding/binary"
@@ -23,6 +26,8 @@ import (
 const (
 	wavFormatPCM        = 1
 	wavFormatIEEEFloat  = 3
+	wavFormatALaw       = 6
+	wavFormatMuLaw      = 7
 	wavFormatExtensible = 0xFFFE
 )
 
@@ -87,8 +92,15 @@ func decodeWAVToPCM16kMono(data []byte) ([]float32, error) {
 	if numChannels == 0 {
 		return nil, fmt.Errorf("invalid channel count: 0")
 	}
-	if audioFormat != wavFormatPCM && audioFormat != wavFormatIEEEFloat {
-		return nil, fmt.Errorf("unsupported WAV audio format: %d (only PCM/IEEE float supported)", audioFormat)
+	if sampleRate == 0 {
+		return nil, fmt.Errorf("invalid sample rate: 0")
+	}
+	if audioFormat != wavFormatPCM && audioFormat != wavFormatIEEEFloat &&
+		audioFormat != wavFormatALaw && audioFormat != wavFormatMuLaw {
+		return nil, fmt.Errorf(
+			"unsupported WAV audio format: %d (supported: PCM, IEEE float, G.711 A-law/mu-law)",
+			audioFormat,
+		)
 	}
 
 	mono, err := toMonoFloat32(pcmData, audioFormat, int(numChannels), int(bitsPerSample))
@@ -118,6 +130,10 @@ func toMonoFloat32(pcm []byte, audioFormat uint16, numChannels, bitsPerSample in
 
 	readSample := func(off int) (float32, error) {
 		switch {
+		case audioFormat == wavFormatALaw && bitsPerSample == 8:
+			return float32(decodeALaw(pcm[off])) / 32768, nil
+		case audioFormat == wavFormatMuLaw && bitsPerSample == 8:
+			return float32(decodeMuLaw(pcm[off])) / 32768, nil
 		case audioFormat == wavFormatIEEEFloat && bitsPerSample == 32:
 			return math.Float32frombits(binary.LittleEndian.Uint32(pcm[off : off+4])), nil
 		case audioFormat == wavFormatPCM && bitsPerSample == 8:
@@ -151,6 +167,37 @@ func toMonoFloat32(pcm []byte, audioFormat uint16, numChannels, bitsPerSample in
 		out[i] = sum / float32(numChannels)
 	}
 	return out, nil
+}
+
+// decodeMuLaw and decodeALaw implement the 8-bit G.711 companding tables algebraically. The
+// decoded range intentionally stays inside int16 (about +/-32124) before normalization.
+func decodeMuLaw(value byte) int16 {
+	decoded := ^value
+	magnitude := ((int(decoded&0x0F) << 3) + 0x84) << ((decoded & 0x70) >> 4)
+	magnitude -= 0x84
+	if decoded&0x80 != 0 {
+		return int16(-magnitude)
+	}
+	return int16(magnitude)
+}
+
+func decodeALaw(value byte) int16 {
+	decoded := value ^ 0x55
+	magnitude := int(decoded&0x0F) << 4
+	segment := (decoded & 0x70) >> 4
+	switch segment {
+	case 0:
+		magnitude += 8
+	case 1:
+		magnitude += 0x108
+	default:
+		magnitude += 0x108
+		magnitude <<= segment - 1
+	}
+	if decoded&0x80 == 0 {
+		return int16(-magnitude)
+	}
+	return int16(magnitude)
 }
 
 // resampleLinear is a plain linear-interpolation resampler — no anti-aliasing filter, which

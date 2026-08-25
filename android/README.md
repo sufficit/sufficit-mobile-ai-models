@@ -40,6 +40,14 @@ Implementado:
   Galaxy A51 (3.6GB). Nunca é auto-provisionado (diferente do embedding): só
   ativa quando o usuário baixa um modelo Whisper explicitamente em "Modelos
   de IA".
+- ✅ **Perfis Whisper validados no Galaxy A51** — Small Q8 para equilíbrio,
+  Medium Q5 para preservar dígitos separados e Large v3 Turbo Q5 para
+  qualidade alta em processamento assíncrono. Tiny/Base funcionam, mas não
+  são recomendados para telefonia em português. Matriz, tempos e critérios:
+  [`docs/whisper-model-compatibility.md`](docs/whisper-model-compatibility.md).
+- ✅ **WAV telefônico sem transcodificação no cliente** — PCM inteiro,
+  float32 e G.711 A-law/μ-law dentro de RIFF/WAVE; qualquer taxa de amostragem
+  e quantidade de canais são convertidas internamente para mono 16 kHz.
 - ✅ **Fix: cleartext bloqueado para 127.0.0.1** — sem `network_security_config.xml`,
   toda chamada OkHttp do app pro loopback local do próprio `tsgo` (inclusive
   o keep-alive de `/health`) falhava com `UnknownServiceException` desde
@@ -130,6 +138,22 @@ dia a dia — `tsgo.aar` já sai commitado com tudo linkado.
 Todos os scripts esperam `ndk;27.2.12479018` instalado
 (`sdkmanager --install "ndk;27.2.12479018"`) — mesma versão usada nos
 binários já commitados, pra manter o toolchain consistente.
+
+## Áudio aceito pela API local
+
+`POST /v1/audio/transcriptions` e `/v1/audio/translations` aceitam um único
+campo multipart `file` em contêiner **RIFF/WAVE**. O decoder nativo suporta:
+
+- PCM inteiro de 8, 16, 24 ou 32 bits;
+- IEEE float de 32 bits;
+- G.711 A-law e μ-law de 8 bits, incluindo gravações telefônicas de 8 kHz;
+- `WAVE_FORMAT_EXTENSIBLE` quando o subformato for um dos anteriores.
+
+Entradas multicanal são reduzidas a mono e reamostradas linearmente para 16
+kHz. MP3, OGG, FLAC, M4A e áudio cru sem cabeçalho WAV **não** são aceitos por
+este adaptador. A inferência HTTP é síncrona e serializada; consumidores devem
+executá-la em uma fila de segundo plano, usar timeout compatível com o perfil e
+tratar HTTP 503 como engine carregando ou ocupado.
 
 ## Publicando na Play Store
 

@@ -65,9 +65,15 @@ oneway interface ISufficitTranscriptionCallback {
 ```
 
 - `audio` is a `ParcelFileDescriptor`, not a raw `byte[]` — avoids the ~1MB combined binder
-  transaction cap a longer audio segment could hit. Audio format: 16kHz mono 16-bit PCM WAV.
+  transaction cap a longer audio segment could hit. The container must be RIFF/WAVE. Accepted
+  payloads are integer PCM (8/16/24/32-bit), IEEE float32, or 8-bit G.711 A-law/μ-law at any
+  sample rate/channel count; the provider downmixes and resamples internally to mono 16kHz.
+  Telephony callers should preserve their native 8kHz G.711 WAV instead of transcoding merely
+  to satisfy IPC. MP3/OGG/FLAC/M4A and headerless raw audio are not part of contract v1.
 - `transcribe()` is async (returns immediately; result/error arrives via `callback`) —
-  inference takes multi-second wall time and must never block a binder thread.
+  inference can take minutes on CPU-only mobile hardware and must never block a binder thread.
+  The provider runs one Whisper inference at a time; consumers should keep a durable/background
+  queue and use a job timeout selected for the active model rather than an interactive timeout.
 - Error codes:
 
   | Code | Name | Meaning |

@@ -9,6 +9,10 @@ import (
 
 // buildWAV assembles a minimal PCM WAV file byte-for-byte — no test fixture file needed.
 func buildWAV(t *testing.T, sampleRate uint32, numChannels, bitsPerSample uint16, samples []int32) []byte {
+	return buildWAVWithFormat(t, wavFormatPCM, sampleRate, numChannels, bitsPerSample, samples)
+}
+
+func buildWAVWithFormat(t *testing.T, audioFormat uint16, sampleRate uint32, numChannels, bitsPerSample uint16, samples []int32) []byte {
 	t.Helper()
 	bytesPerSample := int(bitsPerSample) / 8
 	data := make([]byte, len(samples)*bytesPerSample)
@@ -31,7 +35,7 @@ func buildWAV(t *testing.T, sampleRate uint32, numChannels, bitsPerSample uint16
 
 	buf.WriteString("fmt ")
 	binary.Write(&buf, binary.LittleEndian, uint32(16))
-	binary.Write(&buf, binary.LittleEndian, uint16(1)) // PCM
+	binary.Write(&buf, binary.LittleEndian, audioFormat)
 	binary.Write(&buf, binary.LittleEndian, numChannels)
 	binary.Write(&buf, binary.LittleEndian, sampleRate)
 	byteRate := sampleRate * uint32(numChannels) * uint32(bytesPerSample)
@@ -45,6 +49,36 @@ func buildWAV(t *testing.T, sampleRate uint32, numChannels, bitsPerSample uint16
 	buf.Write(data)
 
 	return buf.Bytes()
+}
+
+func TestDecodeWAV_G711MuLaw(t *testing.T) {
+	wav := buildWAVWithFormat(t, wavFormatMuLaw, 16000, 1, 8, []int32{0xFF, 0x80, 0x00})
+
+	pcm, err := decodeWAVToPCM16kMono(wav)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if len(pcm) != 3 {
+		t.Fatalf("got %d samples, want 3", len(pcm))
+	}
+	if math.Abs(float64(pcm[0])) > 1e-4 || pcm[1] < 0.97 || pcm[2] > -0.97 {
+		t.Fatalf("unexpected mu-law samples: %v", pcm)
+	}
+}
+
+func TestDecodeWAV_G711ALaw(t *testing.T) {
+	wav := buildWAVWithFormat(t, wavFormatALaw, 16000, 1, 8, []int32{0xD5, 0xAA, 0x2A})
+
+	pcm, err := decodeWAVToPCM16kMono(wav)
+	if err != nil {
+		t.Fatalf("decode failed: %v", err)
+	}
+	if len(pcm) != 3 {
+		t.Fatalf("got %d samples, want 3", len(pcm))
+	}
+	if math.Abs(float64(pcm[0])) > 0.001 || pcm[1] < 0.98 || pcm[2] > -0.98 {
+		t.Fatalf("unexpected A-law samples: %v", pcm)
+	}
 }
 
 func TestDecodeWAV_16kHzMono16Bit_PassesThroughUnchanged(t *testing.T) {
@@ -99,6 +133,13 @@ func TestDecodeWAV_ResamplesToTargetRate(t *testing.T) {
 func TestDecodeWAV_RejectsNonWAV(t *testing.T) {
 	if _, err := decodeWAVToPCM16kMono([]byte("not a wav file")); err == nil {
 		t.Error("expected error for non-WAV input, got nil")
+	}
+}
+
+func TestDecodeWAV_RejectsZeroSampleRate(t *testing.T) {
+	wav := buildWAV(t, 0, 1, 16, []int32{0})
+	if _, err := decodeWAVToPCM16kMono(wav); err == nil {
+		t.Error("expected error for zero sample rate, got nil")
 	}
 }
 

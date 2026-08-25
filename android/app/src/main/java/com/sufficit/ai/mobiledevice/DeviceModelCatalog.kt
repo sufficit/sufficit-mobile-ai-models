@@ -7,7 +7,9 @@ data class KnownGoodModel(
     /** Null for kinds where it doesn't apply (e.g. [ModelKind.TRANSCRIPTION]). */
     val dimensions: Int?,
     val sizeGB: Double,
-    val kind: ModelKind
+    val kind: ModelKind,
+    /** Device-specific guidance shown below the size. Null for models without a benchmark. */
+    val details: String? = null
 )
 
 /**
@@ -45,28 +47,50 @@ object DeviceModelCatalog {
         // Hugging Face repo. Multilingual variants (no ".en" suffix): this device serves a
         // Sufficit-wide tailnet, not a single-language deployment.
         KnownGoodModel(
-            label = "Whisper base (multilíngue)",
+            label = "Whisper Large v3 Turbo (Q5_0) — qualidade alta",
+            fileName = "ggml-large-v3-turbo-q5_0.bin",
+            downloadUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo-q5_0.bin",
+            dimensions = null,
+            sizeGB = 0.57,
+            kind = ModelKind.TRANSCRIPTION,
+            details = "Assíncrono; melhor leitura geral no Galaxy A51 (~7min55s para 7,6s telefônicos)"
+        ),
+        KnownGoodModel(
+            label = "Whisper Medium (Q5_0) — dígitos separados",
+            fileName = "ggml-medium-q5_0.bin",
+            downloadUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium-q5_0.bin",
+            dimensions = null,
+            sizeGB = 0.54,
+            kind = ModelKind.TRANSCRIPTION,
+            details = "Assíncrono; preservou melhor números ditados (~10min14s para 7,6s telefônicos)"
+        ),
+        KnownGoodModel(
+            label = "Whisper Small (Q8_0) — melhor equilíbrio",
+            fileName = "ggml-small-q8_0.bin",
+            downloadUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q8_0.bin",
+            dimensions = null,
+            sizeGB = 0.26,
+            kind = ModelKind.TRANSCRIPTION,
+            details = "Recomendado quando memória importa (~4min49s para 7,6s telefônicos)"
+        ),
+        KnownGoodModel(
+            label = "Whisper base (multilíngue) — compatibilidade",
             fileName = "ggml-base.bin",
             downloadUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin",
             dimensions = null,
             sizeGB = 0.14,
-            kind = ModelKind.TRANSCRIPTION
+            kind = ModelKind.TRANSCRIPTION,
+            details = "Baixa precisão no corpus telefônico do Galaxy A51"
         ),
         KnownGoodModel(
-            label = "Whisper tiny (multilíngue)",
+            label = "Whisper tiny (multilíngue) — smoke test",
             fileName = "ggml-tiny.bin",
             downloadUrl = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin",
             dimensions = null,
             sizeGB = 0.075,
-            kind = ModelKind.TRANSCRIPTION
+            kind = ModelKind.TRANSCRIPTION,
+            details = "Menor download; não recomendado para transcrição telefônica de qualidade"
         )
-        // Tried ggml-large-v3-turbo-q5_0.bin (574MB) on the Galaxy A51 reference device: loads
-        // fine, no crash, /health stays responsive, but the full-size 32-layer encoder (only the
-        // decoder is pruned in "turbo") never finished transcribing even 1s of audio after 3.5+
-        // minutes at ~550% CPU with -ng (CPU-only build, no GPU backend compiled in). Not listed
-        // here — this device's Cortex-A55 CPU can't run it in any practical amount of time.
-        // Would need a GPU backend (Vulkan, since Samsung restricts third-party OpenCL access)
-        // to be viable; not attempted.
     )
 
     fun recommended(kind: ModelKind): List<KnownGoodModel> = all.filter { it.kind == kind }
