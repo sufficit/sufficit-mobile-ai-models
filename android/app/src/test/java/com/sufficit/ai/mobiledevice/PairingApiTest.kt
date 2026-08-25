@@ -56,6 +56,9 @@ class PairingApiTest {
         assertEquals("dev", payload.getString("deviceName"))
         assertEquals("Samsung SM-A515F", payload.getString("deviceModel"))
         assertEquals("0.4.1 (5)", payload.getString("appVersion"))
+        assertEquals("com.sufficit.ai.mobiledevice", payload.getString("applicationId"))
+        assertEquals("Sufficit Mobile AI Models", payload.getString("applicationName"))
+        assertTrue(payload.getBoolean("providesModels"))
         assertEquals("/api/ai/mobile-devices/pairing/announce", request.path)
         assertEquals("Sufficit-Pairing tok", request.getHeader("Authorization"))
     }
@@ -147,6 +150,9 @@ class PairingApiTest {
         assertEquals("SM-A515F (user 10)", payload.getString("deviceName"))
         assertEquals("Samsung SM-A515F", payload.getString("deviceModel"))
         assertEquals("0.4.1 (5)", payload.getString("appVersion"))
+        assertEquals("com.sufficit.ai.mobiledevice", payload.getString("applicationId"))
+        assertEquals("Sufficit Mobile AI Models", payload.getString("applicationName"))
+        assertTrue(payload.getBoolean("providesModels"))
         assertEquals("ctx-1", payload.getString("contextId"))
     }
 }

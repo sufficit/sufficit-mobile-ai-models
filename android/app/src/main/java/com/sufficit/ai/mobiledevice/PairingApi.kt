@@ -136,6 +136,9 @@ class PairingApi(
         put("deviceName", deviceName)
         put("deviceModel", deviceModel)
         put("appVersion", appVersion)
+        put("applicationId", APPLICATION_ID)
+        put("applicationName", APPLICATION_NAME)
+        put("providesModels", true)
         extra()
     }.toString().toRequestBody("application/json".toMediaType())
 
@@ -164,5 +167,7 @@ class PairingApi(
 
     private companion object {
         const val TAG = "PairingApi"
+        const val APPLICATION_ID = "com.sufficit.ai.mobiledevice"
+        const val APPLICATION_NAME = "Sufficit Mobile AI Models"
     }
 }
