@@ -143,8 +143,12 @@ func transcribe(pcm []float32, translate bool, language string) (transcriptionRe
 	}
 
 	nThreads := int32(runtime.NumCPU())
-	if nThreads > 6 {
-		nThreads = 6 // matches WhisperServerManager's availableProcessors().coerceAtMost(6)
+	if nThreads > 4 {
+		// Mobile SoCs are usually heterogeneous (big.LITTLE). Using six workers on the
+		// reference Galaxy A51 pulled two efficiency cores into every Whisper graph and
+		// made a 5-second sample take more than 150 seconds. Four workers keep inference
+		// on the performant cluster and also match whisper.cpp's conservative default.
+		nThreads = 4
 	}
 
 	var cLanguage *C.char

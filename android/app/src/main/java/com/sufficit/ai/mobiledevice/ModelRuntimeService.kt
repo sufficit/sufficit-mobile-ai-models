@@ -81,8 +81,8 @@ class ModelRuntimeService : Service() {
     // (PLAN T3.1), tracked separately since the two engines run/fail independently.
     private val healthFailureStreak = mutableMapOf(ModelKind.EMBEDDING to 0, ModelKind.TRANSCRIPTION to 0)
     // Which engine is allowed to be resident right now — mutual exclusion (see class kdoc for
-    // why). In-memory only, resets to EMBEDDING on process restart same as everything else here;
-    // that matches the original default (embedding auto-provisions, transcription doesn't).
+    // why). Restored from ModelRegistry in onCreate so a process restart does not silently
+    // replace a user-selected Whisper runtime with the embedding default.
     @Volatile
     private var activeEngineKind: ModelKind = ModelKind.EMBEDDING
     // Set for the duration of handleTestLocal/handleTestApi — found on-device: without this,
@@ -102,6 +102,7 @@ class ModelRuntimeService : Service() {
         super.onCreate()
         createNotificationChannel()
         migrateLegacyModel()
+        activeEngineKind = registry.activeEngineKind()
     }
 
     /** One-time move of the pre-Fase-6 single-model file into [ModelsDir], so an
@@ -285,6 +286,7 @@ class ModelRuntimeService : Service() {
         deactivateOtherEngines(kind)
         managerFor(kind).switchTo(applicationContext, file)
         registry.setActiveModelFileName(kind, fileName)
+        registry.setActiveEngineKind(kind)
         activeEngineKind = kind
         broadcastStatus()
     }
