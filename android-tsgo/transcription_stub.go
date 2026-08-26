@@ -9,12 +9,21 @@ package tsgo
 import "fmt"
 
 func loadTranscriptionModel(modelPath string) error {
-	return fmt.Errorf("native transcription inference is only available on android")
+	err := fmt.Errorf("native transcription inference is only available on android")
+	transcriptionEngine.beginLifecycle()
+	transcriptionEngine.finishLifecycle("", 0, err)
+	return err
 }
 
-func unloadTranscriptionModel() {}
+func unloadTranscriptionModel() {
+	transcriptionEngine.beginLifecycle()
+	transcriptionEngine.finishLifecycle("", 0, nil)
+}
 
-func isTranscriptionModelLoaded() bool { return false }
+func isTranscriptionModelLoaded() bool {
+	state := transcriptionEngine.snapshot().State
+	return state == engineReady || state == engineBusy
+}
 
 func transcribe(pcm []float32, translate bool, language string) (transcriptionResult, error) {
 	return transcriptionResult{}, fmt.Errorf("native transcription inference is only available on android")

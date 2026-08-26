@@ -26,10 +26,8 @@ var (
 	mu         sync.Mutex
 	httpServer *http.Server
 
-	transcriptionMetaMu              sync.RWMutex
-	activeModelName                  string
-	installedTranscriptionModelNames []string
-	deviceHostname                   string
+	transcriptionMetaMu sync.RWMutex
+	deviceHostname      string
 )
 
 // Status is returned by Status() as JSON — gomobile can't export structs directly,
@@ -61,7 +59,12 @@ func Start(hostname string) string {
 	transcriptionMetaMu.Unlock()
 
 	router := buildRouter()
-	httpServer = &http.Server{Handler: router}
+	httpServer = &http.Server{
+		Handler:           router,
+		ReadHeaderTimeout: 10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    64 << 10,
+	}
 	server := httpServer
 
 	go func() {
@@ -99,57 +102,10 @@ func currentStatusLocked() string {
 	return toJSON(Status{Running: true, Hostname: deviceHostname})
 }
 
-// SetActiveTranscriptionModel records which whisper.cpp model file is the device's configured
-// transcription model. Called from the Kotlin side ONLY by SyncForegroundService, in response
-// to ModelRuntimeService's ACTION_STATUS_CHANGED broadcast — not by WhisperServerManager
-// directly, even though it's the piece that actually knows which model just started. Reason:
-// tsgo's Go globals are per-OS-process, and WhisperServerManager runs in :modelruntime while
-// the HTTP API that reads activeModelName runs in :sync — two separate processes, two separate
-// copies of every Go global, no shared memory. A call from :modelruntime's copy of this
-// function would silently set a value nothing ever reads. SyncForegroundService also queries
-// ModelRuntimeService for the current status once at its own startup (not just reactively),
-// so this reflects "what's configured" (ModelRegistry's persisted value) rather than "what's
-// resident in RAM at the exact instant of the last broadcast" — mutual exclusion (see
-// ModelRuntimeService kdoc) means whisper-server is frequently not the resident engine, but the
-// backend's model-discovery poll (GET /v1/models, see newModelsListProxy) should still list a
-// transcription capability if the user has ever configured one.
-//
-// Fills the "model" field in augmentTranscriptionResponse (whisper-server's own JSON output has
-// no such field) — which model actually answered THIS request. For the full device catalog
-// (every installed transcription model, not just the one currently resident), see
-// SetInstalledTranscriptionModels.
-func SetActiveTranscriptionModel(name string) {
-	transcriptionMetaMu.Lock()
-	activeModelName = name
-	transcriptionMetaMu.Unlock()
-}
-
-// SetInstalledTranscriptionModels records every whisper.cpp model file installed on this
-// device — namesJSON is a JSON string array, e.g. ["ggml-tiny.bin","ggml-base.bin"]. Unlike
-// SetActiveTranscriptionModel (one configured/resident model), a device can have several
-// Whisper models downloaded at once (see ModelsScreen's "Instalados" section), and the
-// backend's discovery poll (GET /v1/models, see newModelsListProxy) should list all of them so
-// whoever's configuring routing on that side can choose — not just whichever one happens to be
-// selected in the phone's own UI right now. Same cross-process reasoning as
-// SetActiveTranscriptionModel: called by SyncForegroundService (:sync), which gets the list via
-// a plain filesystem scan (ModelRegistry.installedModels — safe to call from either process,
-// unlike the SharedPreferences-backed "active model" value), not by anything in :modelruntime.
-func SetInstalledTranscriptionModels(namesJSON string) {
-	var names []string
-	if err := json.Unmarshal([]byte(namesJSON), &names); err != nil {
-		log.Printf("[tsgo] SetInstalledTranscriptionModels: invalid JSON, ignoring: %v", err)
-		return
-	}
-	transcriptionMetaMu.Lock()
-	installedTranscriptionModelNames = names
-	transcriptionMetaMu.Unlock()
-}
-
 // LoadEmbeddingModel loads modelPath as the resident in-process embedding model (see
 // embedding.go) — replaces LlamaServerManager.start()/switchTo() from the old
-// subprocess-per-engine architecture. Must be called from :sync, same cross-process reasoning
-// as SetActiveTranscriptionModel: the HTTP server that actually serves /v1/embeddings
-// (buildRouter, started by SyncForegroundService) runs in :sync,
+// subprocess-per-engine architecture. Must be called from :sync: the HTTP server that actually
+// serves /v1/embeddings (buildRouter, started by SyncForegroundService) runs in :sync,
 // and Go globals — including the loaded llama_context this holds onto — don't cross process
 // boundaries. A call made from :modelruntime would load a model into a copy of this package
 // nothing ever serves requests from. Returns "" on success, an error message otherwise.
@@ -321,10 +277,38 @@ func buildRouter() http.Handler {
 // device is still a healthy device, just one with nothing to dispatch to right now).
 func newHealthHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"status":"ok"}`))
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status":        "ok",
+			"embedding":     engineHealthPayload(embeddingEngine.snapshot()),
+			"transcription": engineHealthPayload(transcriptionEngine.snapshot()),
+		})
 	})
+}
+
+func engineHealthPayload(snapshot engineSnapshot) map[string]any {
+	payload := map[string]any{"state": snapshot.State}
+	if snapshot.Model != "" {
+		payload["model"] = snapshot.Model
+	}
+	if snapshot.Dimensions > 0 {
+		payload["dimensions"] = snapshot.Dimensions
+	}
+	if !snapshot.BusySince.IsZero() {
+		payload["busy_since"] = snapshot.BusySince
+	}
+	if !snapshot.LastReady.IsZero() {
+		payload["last_ready"] = snapshot.LastReady
+	}
+	if snapshot.LastError != "" {
+		payload["last_error"] = snapshot.LastError
+	}
+	return payload
 }
 
 // noModelBody is returned (as a synthetic 503) when the local model server for this
@@ -340,14 +324,14 @@ const noModelBody = `{"error":"no model loaded","status":"idle"}`
 // "capabilities" is the field ProviderModelPayloadParser checks first, before falling back to
 // name-sniffing the id — set explicitly rather than relying on the fallback (whisper.cpp model
 // filenames like "ggml-tiny.bin" don't contain "whisper"/"transcri"/"asr" themselves).
-func transcriptionModelListEntry(modelName string) map[string]any {
-	id := strings.TrimSuffix(modelName, ".bin")
+func transcriptionModelListEntry(id string, status engineState) map[string]any {
 	return map[string]any{
 		"id":           id,
 		"object":       "model",
 		"created":      0,
 		"owned_by":     "whispercpp",
 		"capabilities": []string{"transcription"},
+		"status":       status,
 	}
 }
 
@@ -359,17 +343,17 @@ func transcriptionModelListEntry(modelName string) map[string]any {
 // "gte-Qwen2-1.5B-instruct-Q4_K_M.gguf" -> "gte-qwen2-1.5b-instruct-q4_k_m-embedding"). That
 // determinism is what makes synthesizing THIS side safe, unlike a naive guess would be.
 type embeddingModelEntry struct {
-	ID         string `json:"id"`
-	Dimensions int    `json:"dimensions"` // 0 = unknown (not in DeviceModelCatalog) — omitted from the entry.
+	ID                 string `json:"id"`
+	Dimensions         int    `json:"dimensions"` // 0 = unknown (not in DeviceModelCatalog) — omitted from the entry.
+	SupportsDimensions bool   `json:"supports_dimensions"`
+	MinimumDimensions  int    `json:"min_dimensions"`
 }
 
 var installedEmbeddingModels []embeddingModelEntry
 
-// SetInstalledEmbeddingModels records every embedding model installed on this device (not just
-// whichever one llama-server currently has loaded) — entriesJSON is a JSON array of
-// {"id","dimensions"} objects, dimensions 0 if unknown. Same reasoning and cross-process
-// wiring as SetInstalledTranscriptionModels: a device can have several embedding models
-// downloaded (see ModelsScreen), and GET /v1/models's discovery poll should list all of them.
+// SetInstalledEmbeddingModels records metadata for downloaded embedding files. Discovery still
+// advertises only the resident model; this catalog is consulted solely to enrich that active
+// entry with model-specific capabilities such as safe Matryoshka dimensions.
 func SetInstalledEmbeddingModels(entriesJSON string) {
 	var entries []embeddingModelEntry
 	if err := json.Unmarshal([]byte(entriesJSON), &entries); err != nil {
@@ -383,51 +367,76 @@ func SetInstalledEmbeddingModels(entriesJSON string) {
 
 // embeddingModelListEntry mirrors transcriptionModelListEntry — see its doc for why
 // "capabilities" is set explicitly rather than relying on id-sniffing.
-func embeddingModelListEntry(e embeddingModelEntry) map[string]any {
+func embeddingModelListEntry(e embeddingModelEntry, status engineState) map[string]any {
 	entry := map[string]any{
 		"id":           e.ID,
 		"object":       "model",
 		"created":      0,
 		"owned_by":     "llamacpp",
 		"capabilities": []string{"embedding"},
+		"status":       status,
+	}
+	if e.SupportsDimensions {
+		entry["supported_parameters"] = []string{"dimensions"}
 	}
 	if e.Dimensions > 0 {
-		entry["meta"] = map[string]any{"n_embd": e.Dimensions}
+		meta := map[string]any{"n_embd": e.Dimensions}
+		if e.MinimumDimensions > 0 {
+			meta["min_dimensions"] = e.MinimumDimensions
+		}
+		entry["meta"] = meta
 	}
 	return entry
 }
 
-// newModelsListHandler serves GET /v1/models entirely in-process from installedEmbeddingModels
-// + installedTranscriptionModelNames — replaces newModelsListProxy, which used to reverse-proxy
-// to 127.0.0.1:ModelPort to get llama-server's own live response and merge in whatever it
-// didn't already know about. That target doesn't exist anymore (embedding.go/transcription.go
-// serve in-process; nothing external listens on ModelPort to dial), and dialing it would now
-// just be this exact same process's own local loopback listener answering itself — an infinite
-// self-proxy loop, not a bug this handler can have by construction. installedEmbeddingModels
-// already carries every installed embedding model INCLUDING whichever one is currently loaded
-// (SyncForegroundService pushes the full list unconditionally, with dimensions from
-// DeviceModelCatalog) — there's no longer a separate "live" entry to dedupe against, so this is
-// simpler than the two functions it replaces, not just safer.
+func embeddingMetadata(modelID string, nativeDimensions int) embeddingModelEntry {
+	entry := embeddingModelEntry{ID: modelID, Dimensions: nativeDimensions}
+	transcriptionMetaMu.RLock()
+	defer transcriptionMetaMu.RUnlock()
+	for _, candidate := range installedEmbeddingModels {
+		if strings.EqualFold(candidate.ID, modelID) {
+			if candidate.Dimensions > 0 {
+				entry.Dimensions = candidate.Dimensions
+			}
+			entry.SupportsDimensions = candidate.SupportsDimensions
+			entry.MinimumDimensions = candidate.MinimumDimensions
+			break
+		}
+	}
+	return entry
+}
+
+// newModelsListHandler serves only models that can answer now. Downloaded-but-idle files remain
+// visible in the Android UI, but are deliberately absent here so Sufficit AI never routes a
+// request to a model this process cannot execute without first changing device state.
 func newModelsListHandler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		transcriptionMetaMu.RLock()
-		transcriptionNames := installedTranscriptionModelNames
-		embeddings := installedEmbeddingModels
-		transcriptionMetaMu.RUnlock()
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		embedding := embeddingEngine.snapshot()
+		transcription := transcriptionEngine.snapshot()
 
 		w.Header().Set("Content-Type", "application/json")
-		if len(transcriptionNames) == 0 && len(embeddings) == 0 {
+		embeddingAvailable := embedding.State == engineReady || embedding.State == engineBusy
+		transcriptionAvailable := transcription.State == engineReady || transcription.State == engineBusy
+		if !embeddingAvailable && !transcriptionAvailable {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_, _ = w.Write([]byte(noModelBody))
 			return
 		}
 
-		entries := make([]map[string]any, 0, len(transcriptionNames)+len(embeddings))
-		for _, e := range embeddings {
-			entries = append(entries, embeddingModelListEntry(e))
+		entries := make([]map[string]any, 0, 2)
+		if embeddingAvailable {
+			entries = append(entries, embeddingModelListEntry(
+				embeddingMetadata(embedding.Model, embedding.Dimensions),
+				embedding.State,
+			))
 		}
-		for _, name := range transcriptionNames {
-			entries = append(entries, transcriptionModelListEntry(name))
+		if transcriptionAvailable {
+			entries = append(entries, transcriptionModelListEntry(transcription.Model, transcription.State))
 		}
 		out, err := json.Marshal(map[string]any{
 			"object": "list",

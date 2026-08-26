@@ -12,17 +12,31 @@ package tsgo
 import "fmt"
 
 func loadEmbeddingModel(modelPath string) error {
-	return fmt.Errorf("native embedding inference is only available on android")
+	err := fmt.Errorf("native embedding inference is only available on android")
+	embeddingEngine.beginLifecycle()
+	embeddingEngine.finishLifecycle("", 0, err)
+	return err
 }
 
-func unloadEmbeddingModel() {}
+func unloadEmbeddingModel() {
+	embeddingEngine.beginLifecycle()
+	embeddingEngine.finishLifecycle("", 0, nil)
+}
 
-func isEmbeddingModelLoaded() bool { return false }
+func isEmbeddingModelLoaded() bool {
+	state := embeddingEngine.snapshot().State
+	return state == engineReady || state == engineBusy
+}
 
-func embeddingDimensions() int { return 0 }
+func embeddingDimensions() int { return embeddingEngine.snapshot().Dimensions }
+
+func embedWithUsage(text string) (embeddingInferenceResult, error) {
+	return embeddingInferenceResult{}, fmt.Errorf("native embedding inference is only available on android")
+}
 
 func embed(text string) ([]float32, error) {
-	return nil, fmt.Errorf("native embedding inference is only available on android")
+	result, err := embedWithUsage(text)
+	return result.Vector, err
 }
 
-func embeddingModelID() string { return "" }
+func embeddingModelID() string { return embeddingEngine.snapshot().Model }

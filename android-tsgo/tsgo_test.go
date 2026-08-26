@@ -1,173 +1,184 @@
 package tsgo
 
 import (
+	"bytes"
 	"encoding/json"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 )
 
-func setInstalled(t *testing.T, names ...string) {
-	t.Helper()
-	b, err := json.Marshal(names)
-	if err != nil {
-		t.Fatalf("marshal installed names: %v", err)
-	}
-	SetInstalledTranscriptionModels(string(b))
+func resetEngineControllers() {
+	embeddingEngine = newEngineController()
+	transcriptionEngine = newEngineController()
 }
 
-// setInstalledEmbeddings resets installedEmbeddingModels — every test that depends on its
-// starting state (most, since it's a shared package var) must call this explicitly, since Go
-// tests in one package run sequentially, not isolated.
 func setInstalledEmbeddings(t *testing.T, entries ...embeddingModelEntry) {
 	t.Helper()
 	if entries == nil {
 		entries = []embeddingModelEntry{}
 	}
-	b, err := json.Marshal(entries)
+	payload, err := json.Marshal(entries)
 	if err != nil {
-		t.Fatalf("marshal installed embeddings: %v", err)
+		t.Fatal(err)
 	}
-	SetInstalledEmbeddingModels(string(b))
+	SetInstalledEmbeddingModels(string(payload))
 }
 
-func TestModelsListHandler_ListsAllInstalledEmbeddingAndTranscriptionModels(t *testing.T) {
-	// newModelsListHandler builds the whole catalog from installedEmbeddingModels +
-	// installedTranscriptionModelNames directly — no live dial to merge against (see its doc:
-	// that used to be a real llama-server subprocess, now it'd just be this same process
-	// answering itself). Kotlin already includes the currently-loaded embedding model in
-	// installedEmbeddingModels (SyncForegroundService pushes the full installed list
-	// unconditionally), so there's nothing left to dedupe.
-	setInstalled(t, "ggml-tiny.bin", "ggml-base.bin")
-	setInstalledEmbeddings(t, embeddingModelEntry{ID: "gte-qwen2-1.5b-instruct-q4_k_m-embedding", Dimensions: 1536})
+func setEngineReady(engine *engineController, model string, dimensions int) {
+	engine.beginLifecycle()
+	engine.finishLifecycle(model, dimensions, nil)
+}
+
+func TestModelsListHandlerListsOnlyResidentModels(t *testing.T) {
+	resetEngineControllers()
+	setInstalledEmbeddings(t,
+		embeddingModelEntry{ID: "active-embedding", Dimensions: 1024, SupportsDimensions: true, MinimumDimensions: 32},
+		embeddingModelEntry{ID: "installed-but-idle", Dimensions: 1536},
+	)
+	setEngineReady(embeddingEngine, "active-embedding", 1024)
+	setEngineReady(transcriptionEngine, "ggml-small-q8_0", 0)
 
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	newModelsListHandler().ServeHTTP(rec, req)
-
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-
-	var got struct {
-		Object string           `json:"object"`
-		Data   []map[string]any `json:"data"`
-	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("response not valid JSON: %v", err)
-	}
-	if len(got.Data) != 3 {
-		t.Fatalf("data has %d entries, want 3 (1 embedding + 2 transcription): %v", len(got.Data), got.Data)
-	}
-
-	embedding := got.Data[0]
-	if embedding["id"] != "gte-qwen2-1.5b-instruct-q4_k_m-embedding" {
-		t.Errorf("embedding entry id = %v", embedding["id"])
-	}
-	meta, _ := embedding["meta"].(map[string]any)
-	if meta == nil || meta["n_embd"] != float64(1536) {
-		t.Errorf("embedding entry meta.n_embd = %v, want 1536", embedding["meta"])
-	}
-
-	wantIDs := []string{"ggml-tiny", "ggml-base"}
-	for i, wantID := range wantIDs {
-		entry := got.Data[i+1]
-		if entry["id"] != wantID {
-			t.Errorf("transcription entry %d id = %v, want %s", i, entry["id"], wantID)
-		}
-		caps, _ := entry["capabilities"].([]any)
-		if len(caps) != 1 || caps[0] != "transcription" {
-			t.Errorf("transcription entry %d capabilities = %v, want [transcription]", i, entry["capabilities"])
-		}
-	}
-}
-
-func TestModelsListHandler_EmbeddingEntryOmitsMetaWhenDimensionsUnknown(t *testing.T) {
-	setInstalled(t)
-	setInstalledEmbeddings(t, embeddingModelEntry{ID: "some-random-hf-model", Dimensions: 0})
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	rec := httptest.NewRecorder()
-	newModelsListHandler().ServeHTTP(rec, req)
 
 	var got struct {
 		Data []map[string]any `json:"data"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("response not valid JSON: %v", err)
+		t.Fatal(err)
 	}
-	if len(got.Data) != 1 {
-		t.Fatalf("data has %d entries, want 1: %v", len(got.Data), got.Data)
+	if len(got.Data) != 2 {
+		t.Fatalf("models=%v, want exactly the two resident engines", got.Data)
 	}
-	if _, hasMeta := got.Data[0]["meta"]; hasMeta {
-		t.Errorf("entry has meta with unknown dimensions: %v", got.Data[0])
+	if got.Data[0]["id"] != "active-embedding" || got.Data[1]["id"] != "ggml-small-q8_0" {
+		t.Fatalf("unexpected models: %v", got.Data)
 	}
-}
-
-func TestModelsListHandler_NoTranscriptionEntryWhenNoneInstalled(t *testing.T) {
-	setInstalled(t) // nothing installed
-	setInstalledEmbeddings(t, embeddingModelEntry{ID: "some-model", Dimensions: 0})
-
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
-	rec := httptest.NewRecorder()
-	newModelsListHandler().ServeHTTP(rec, req)
-
-	var got struct {
-		Data []map[string]any `json:"data"`
+	parameters, _ := got.Data[0]["supported_parameters"].([]any)
+	if len(parameters) != 1 || parameters[0] != "dimensions" {
+		t.Fatalf("supported_parameters=%v", got.Data[0]["supported_parameters"])
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
-		t.Fatalf("response not valid JSON: %v", err)
-	}
-	if len(got.Data) != 1 {
-		t.Errorf("data has %d entries, want 1 (no transcription entry should be added): %v", len(got.Data), got.Data)
+	meta, _ := got.Data[0]["meta"].(map[string]any)
+	if meta["n_embd"] != float64(1024) || meta["min_dimensions"] != float64(32) {
+		t.Fatalf("meta=%v", meta)
 	}
 }
 
-func TestModelsListHandler_Returns503WhenNothingInstalled(t *testing.T) {
-	setInstalled(t)
-	setInstalledEmbeddings(t)
+func TestModelsListHandlerIncludesBusyResidentModel(t *testing.T) {
+	resetEngineControllers()
+	setInstalledEmbeddings(t, embeddingModelEntry{ID: "active-embedding", Dimensions: 3})
+	setEngineReady(embeddingEngine, "active-embedding", 3)
+	if _, ok := embeddingEngine.tryBeginInference(); !ok {
+		t.Fatal("failed to reserve engine")
+	}
+	defer embeddingEngine.finishInference(nil)
 
-	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	rec := httptest.NewRecorder()
-	newModelsListHandler().ServeHTTP(rec, req)
+	newModelsListHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"status":"busy"`)) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
 
+func TestModelsListHandlerReturns503WithoutResidentModel(t *testing.T) {
+	resetEngineControllers()
+	setInstalledEmbeddings(t, embeddingModelEntry{ID: "downloaded-only", Dimensions: 3})
+	rec := httptest.NewRecorder()
+	newModelsListHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
 	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503 (nothing installed)", rec.Code)
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
-// Real transcription inference only exists under the "android" build tag (cgo/whisper.cpp,
-// arm64-only static libs) — isTranscriptionModelLoaded()'s host stub always reports false, so
-// these are the only paths exercisable on the host, same limitation newEmbeddingsHandler already
-// has (see embedding_http.go: no tests at all for the same reason). Real behavior is verified
-// on-device (see PLAN: native transcription migration).
-
-func TestTranscriptionsHandler_NoModelLoaded503(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", nil)
+func TestHealthReportsBothEngineStates(t *testing.T) {
+	resetEngineControllers()
+	setEngineReady(embeddingEngine, "active-embedding", 3)
 	rec := httptest.NewRecorder()
-	newTranscriptionsHandler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503 (no model loaded)", rec.Code)
+	newHealthHandler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/health", nil))
+	if rec.Code != http.StatusOK || !bytes.Contains(rec.Body.Bytes(), []byte(`"model":"active-embedding"`)) {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
 }
 
-func TestTranscriptionsHandler_WrongMethod(t *testing.T) {
-	req := httptest.NewRequest(http.MethodGet, "/v1/audio/transcriptions", nil)
-	rec := httptest.NewRecorder()
-	newTranscriptionsHandler().ServeHTTP(rec, req)
+func audioMultipartRequest(t *testing.T, model string) *http.Request {
+	t.Helper()
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	file, err := writer.CreateFormFile("file", "sample.wav")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wav := buildWAV(t, 16000, 1, 16, []int32{0, 0, 0, 0})
+	if _, err := file.Write(wav); err != nil {
+		t.Fatal(err)
+	}
+	if model != "" {
+		_ = writer.WriteField("model", model)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	return req
+}
 
+func readyAudioRuntime() (audioHTTPRuntime, *engineController, *int) {
+	controller := newEngineController()
+	setEngineReady(controller, "ggml-small-q8_0", 0)
+	calls := 0
+	return audioHTTPRuntime{
+		snapshot: controller.snapshot,
+		tryBegin: controller.tryBeginInference,
+		finish:   controller.finishInference,
+		transcribe: func([]float32, bool, string) (transcriptionResult, error) {
+			calls++
+			return transcriptionResult{Text: "teste", Language: "pt"}, nil
+		},
+	}, controller, &calls
+}
+
+func TestTranscriptionsHandlerValidatesModel(t *testing.T) {
+	runtime, _, calls := readyAudioRuntime()
+	rec := httptest.NewRecorder()
+	newAudioHandlerWithRuntime(false, runtime).ServeHTTP(rec, audioMultipartRequest(t, "wrong-model"))
+	if rec.Code != http.StatusConflict || *calls != 0 {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, *calls, rec.Body.String())
+	}
+}
+
+func TestTranscriptionsHandlerReturns429WhenBusy(t *testing.T) {
+	runtime, controller, calls := readyAudioRuntime()
+	if _, ok := controller.tryBeginInference(); !ok {
+		t.Fatal("failed to reserve engine")
+	}
+	defer controller.finishInference(nil)
+	rec := httptest.NewRecorder()
+	newAudioHandlerWithRuntime(false, runtime).ServeHTTP(rec, audioMultipartRequest(t, "ggml-small-q8_0"))
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || *calls != 0 {
+		t.Fatalf("status=%d retry=%q calls=%d body=%s", rec.Code, rec.Header().Get("Retry-After"), *calls, rec.Body.String())
+	}
+}
+
+func TestTranscriptionsHandlerReturnsOpenAICompatibleResult(t *testing.T) {
+	runtime, _, calls := readyAudioRuntime()
+	rec := httptest.NewRecorder()
+	newAudioHandlerWithRuntime(false, runtime).ServeHTTP(rec, audioMultipartRequest(t, "ggml-small-q8_0"))
+	if rec.Code != http.StatusOK || *calls != 1 || !bytes.Contains(rec.Body.Bytes(), []byte(`"text":"teste"`)) {
+		t.Fatalf("status=%d calls=%d body=%s", rec.Code, *calls, rec.Body.String())
+	}
+}
+
+func TestTranscriptionsHandlerWrongMethod(t *testing.T) {
+	runtime, _, _ := readyAudioRuntime()
+	rec := httptest.NewRecorder()
+	newAudioHandlerWithRuntime(false, runtime).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/audio/transcriptions", nil))
 	if rec.Code != http.StatusMethodNotAllowed {
-		t.Errorf("status = %d, want 405", rec.Code)
-	}
-}
-
-func TestTranslationsHandler_NoModelLoaded503(t *testing.T) {
-	req := httptest.NewRequest(http.MethodPost, "/v1/audio/translations", nil)
-	rec := httptest.NewRecorder()
-	newTranslationsHandler().ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("status = %d, want 503 (no model loaded)", rec.Code)
+		t.Fatalf("status=%d", rec.Code)
 	}
 }

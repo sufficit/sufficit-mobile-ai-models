@@ -56,6 +56,7 @@ class SyncForegroundService : Service() {
     // startup. Serialize them because tsgo.Start() owns process-global Go state and rejects a
     // concurrent second start, leaving the device announced but without a usable tailnet IP.
     private val syncMutex = Mutex()
+    private val modelStatusMutex = Mutex()
     private var loopJob: Job? = null
 
     private lateinit var store: PairingStore
@@ -100,74 +101,12 @@ class SyncForegroundService : Service() {
         val receiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context, intent: Intent) {
                 if (intent.action != ModelRuntimeService.ACTION_STATUS_CHANGED) return
-                val name = intent.getStringExtra(ModelRuntimeService.EXTRA_ACTIVE_TRANSCRIPTION_MODEL).orEmpty()
-                tsgo.Tsgo.setActiveTranscriptionModel(name)
-
-                // The actual embedding model load/unload now happens here — this process is
-                // the only one running tsgo's HTTP server (see NativeEmbeddingManager's kdoc
-                // for the full cross-process story). ModelRuntimeService (:modelruntime) can
-                // only ever record *intent*; this is where it's carried out for real.
-                // loadEmbeddingModel is idempotent (no-ops if this exact path is already
-                // loaded) — no need to track "did we already load this" separately here.
-                val embeddingPath = intent.getStringExtra(ModelRuntimeService.EXTRA_EMBEDDING_MODEL_PATH)
-                if (embeddingPath.isNullOrEmpty()) {
-                    tsgo.Tsgo.unloadEmbeddingModel()
-                } else {
-                    val loadError = tsgo.Tsgo.loadEmbeddingModel(embeddingPath)
-                    if (loadError.isNotEmpty()) {
-                        android.util.Log.e("SyncForegroundService", "loadEmbeddingModel(\"$embeddingPath\") failed: $loadError")
+                val statusIntent = Intent(intent)
+                scope.launch {
+                    modelStatusMutex.withLock {
+                        applyModelStatus(statusIntent, syncRegistry)
                     }
                 }
-
-                // Same story as embeddingPath above, transcription's counterpart — the actual
-                // whisper.cpp model load/unload happens here, in the process running tsgo's HTTP
-                // server (see NativeTranscriptionManager's kdoc).
-                val transcriptionPath = intent.getStringExtra(ModelRuntimeService.EXTRA_TRANSCRIPTION_MODEL_PATH)
-                if (transcriptionPath.isNullOrEmpty()) {
-                    tsgo.Tsgo.unloadTranscriptionModel()
-                } else {
-                    val loadError = tsgo.Tsgo.loadTranscriptionModel(transcriptionPath)
-                    if (loadError.isNotEmpty()) {
-                        android.util.Log.e("SyncForegroundService", "loadTranscriptionModel(\"$transcriptionPath\") failed: $loadError")
-                    }
-                }
-
-                // Every installed Whisper model should be discoverable (GET /v1/models), not
-                // just whichever one is currently selected — a device commonly has more than
-                // one downloaded at once. installedModels() is a plain filesystem scan, safe to
-                // call from this process directly (unlike the SharedPreferences-backed "active
-                // model" name above, which needs the broadcast to avoid a stale cross-process
-                // read).
-                val installedNames = syncRegistry.installedModels(applicationContext, ModelKind.TRANSCRIPTION)
-                    .map { it.name }
-                val installedNamesJson = org.json.JSONArray(installedNames).toString()
-                tsgo.Tsgo.setInstalledTranscriptionModels(installedNamesJson)
-
-                // Same idea for embeddings — a device can have more than one downloaded (e.g.
-                // both DeviceModelCatalog recommendations). Only ONE .gguf is ever loaded at a
-                // time (NativeEmbeddingManager), so any OTHER installed file needs its catalog
-                // entry synthesized here rather than read off the live model; aliasFor is
-                // deterministic from the filename alone (confirmed against a real device
-                // response), so the id is guaranteed to match what the loaded model itself
-                // would report — dimensions come from DeviceModelCatalog when the file matches
-                // a known recommendation, 0 (omitted) otherwise.
-                val installedEmbeddings = syncRegistry.installedModels(applicationContext, ModelKind.EMBEDDING)
-                    .map { file ->
-                        val dimensions = DeviceModelCatalog.all
-                            .firstOrNull { it.kind == ModelKind.EMBEDDING && it.fileName == file.name }
-                            ?.dimensions ?: 0
-                        org.json.JSONObject()
-                            .put("id", NativeEmbeddingManager.aliasFor(file))
-                            .put("dimensions", dimensions)
-                    }
-                val installedEmbeddingsJson = org.json.JSONArray(installedEmbeddings).toString()
-                tsgo.Tsgo.setInstalledEmbeddingModels(installedEmbeddingsJson)
-
-                android.util.Log.i(
-                    "SyncForegroundService",
-                    "pushing models to tsgo (this process): active transcription=\"$name\", " +
-                        "installed transcription=$installedNamesJson, installed embeddings=$installedEmbeddingsJson"
-                )
             }
         }
         ContextCompat.registerReceiver(
@@ -175,6 +114,70 @@ class SyncForegroundService : Service() {
             ContextCompat.RECEIVER_NOT_EXPORTED
         )
         modelStatusReceiver = receiver
+    }
+
+    private fun applyModelStatus(intent: Intent, registry: ModelRegistry) {
+        val embeddingPath = intent.getStringExtra(ModelRuntimeService.EXTRA_EMBEDDING_MODEL_PATH)
+        val transcriptionPath = intent.getStringExtra(ModelRuntimeService.EXTRA_TRANSCRIPTION_MODEL_PATH)
+
+        // IMPORTANT: unload the opposite native engine BEFORE loading the selected one.
+        // Loading first briefly keeps both ~0.5-1.5 GiB runtimes resident and the Android
+        // low-memory killer terminates this foreground process on reference devices.
+        when {
+            !embeddingPath.isNullOrEmpty() && !transcriptionPath.isNullOrEmpty() -> {
+                android.util.Log.e(
+                    "SyncForegroundService",
+                    "invalid status: embedding and transcription requested together; unloading both"
+                )
+                tsgo.Tsgo.unloadEmbeddingModel()
+                tsgo.Tsgo.unloadTranscriptionModel()
+            }
+            !embeddingPath.isNullOrEmpty() -> {
+                tsgo.Tsgo.unloadTranscriptionModel()
+                val loadError = tsgo.Tsgo.loadEmbeddingModel(embeddingPath)
+                if (loadError.isNotEmpty()) {
+                    android.util.Log.e(
+                        "SyncForegroundService",
+                        "loadEmbeddingModel(\"$embeddingPath\") failed: $loadError"
+                    )
+                }
+            }
+            !transcriptionPath.isNullOrEmpty() -> {
+                tsgo.Tsgo.unloadEmbeddingModel()
+                val loadError = tsgo.Tsgo.loadTranscriptionModel(transcriptionPath)
+                if (loadError.isNotEmpty()) {
+                    android.util.Log.e(
+                        "SyncForegroundService",
+                        "loadTranscriptionModel(\"$transcriptionPath\") failed: $loadError"
+                    )
+                }
+            }
+            else -> {
+                tsgo.Tsgo.unloadEmbeddingModel()
+                tsgo.Tsgo.unloadTranscriptionModel()
+            }
+        }
+
+        // Discovery advertises only the resident model. Downloaded embedding files are sent
+        // solely as metadata for native dimensions and model-specific MRL support.
+        val installedEmbeddings = registry.installedModels(applicationContext, ModelKind.EMBEDDING)
+            .map { file ->
+                val catalogModel = DeviceModelCatalog.all
+                    .firstOrNull { it.kind == ModelKind.EMBEDDING && it.fileName == file.name }
+                org.json.JSONObject()
+                    .put("id", NativeEmbeddingManager.aliasFor(file))
+                    .put("dimensions", catalogModel?.dimensions ?: 0)
+                    .put("supports_dimensions", catalogModel?.supportsDimensions == true)
+                    .put("min_dimensions", catalogModel?.minDimensions ?: 0)
+            }
+        val installedEmbeddingsJson = org.json.JSONArray(installedEmbeddings).toString()
+        tsgo.Tsgo.setInstalledEmbeddingModels(installedEmbeddingsJson)
+
+        android.util.Log.i(
+            "SyncForegroundService",
+            "active embedding=$embeddingPath, active transcription=$transcriptionPath, " +
+                "embedding metadata=$installedEmbeddingsJson"
+        )
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -191,7 +194,15 @@ class SyncForegroundService : Service() {
         ModelRuntimeService.queryStatus(applicationContext)
 
         when (intent?.action) {
-            ACTION_SYNC_NOW -> scope.launch { syncOnce() }
+            ACTION_SYNC_NOW -> {
+                // This extra is accepted only by this explicit, non-exported service. It closes
+                // the EncryptedSharedPreferences cross-process visibility gap during the first
+                // token pairing: :sync persists its own copy before validating the credential.
+                val pairingToken = intent.getStringExtra(EXTRA_PAIRING_TOKEN)
+                    ?.trim()
+                    ?.takeIf { it.isNotEmpty() }
+                scope.launch { syncOnce(pairingToken) }
+            }
             ACTION_LOGOUT -> {
                 loopJob?.cancel()
                 scope.launch {
@@ -218,9 +229,17 @@ class SyncForegroundService : Service() {
         }
     }
 
-    private suspend fun syncOnce() = syncMutex.withLock {
+    private suspend fun syncOnce(pairingTokenOverride: String? = null) = syncMutex.withLock {
+        if (pairingTokenOverride != null) {
+            store.pairingToken = pairingTokenOverride
+        }
         if (!store.isPaired()) return@withLock
         val result = performSync(store, api, oauth, vpn)
+        if (pairingTokenOverride != null && result is AnnounceResult.Failure) {
+            // The UI clears its own copy after receiving this failure. Clear the service-process
+            // copy as well so the heartbeat does not keep retrying a rejected credential.
+            store.pairingToken = null
+        }
         val message = when (result) {
             is AnnounceResult.Success -> getString(R.string.sync_success)
             is AnnounceResult.Failure -> getString(R.string.sync_failure, result.message)
@@ -311,14 +330,18 @@ class SyncForegroundService : Service() {
         const val EXTRA_SYNC_MESSAGE = "syncMessage"
         const val EXTRA_TAILNET_IP = "tailnetIp"
         const val EXTRA_LAST_SYNC_AT_MS = "lastSyncAtMs"
+        private const val EXTRA_PAIRING_TOKEN = "pairingToken"
 
         fun start(context: Context) {
             val intent = Intent(context, SyncForegroundService::class.java)
             ContextCompat.startForegroundService(context, intent)
         }
 
-        fun syncNow(context: Context) {
+        fun syncNow(context: Context, pairingToken: String? = null) {
             val intent = Intent(context, SyncForegroundService::class.java).setAction(ACTION_SYNC_NOW)
+            if (!pairingToken.isNullOrBlank()) {
+                intent.putExtra(EXTRA_PAIRING_TOKEN, pairingToken)
+            }
             ContextCompat.startForegroundService(context, intent)
         }
 

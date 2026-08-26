@@ -5,6 +5,7 @@ on:
     paths:
       - "android/**"
       - "android-tsgo/**"
+      - "scripts/**"
       - ".github/workflows/release.yml"
   workflow_dispatch:
 jobs:
@@ -21,6 +22,9 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+
+      - name: Verify committed native runtime
+        run: ./scripts/check-tsgo-aar.sh
 
       # Native libs (jniLibs, tsgo.aar) are prebuilt and committed to the repo — see
       # scripts/build-*.sh — so this job never needs the NDK, same as ci.yml's debug build.

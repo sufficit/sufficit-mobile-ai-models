@@ -1,7 +1,7 @@
 # Sufficit Mobile AI — Android app
 
 App Android que transforma o aparelho num **AI provider** do `sufficit-ai`:
-roda um modelo local (embeddings, hoje Qwen3-Embedding-4B) e se anuncia pro
+roda um modelo local de embeddings ou Whisper e se anuncia pro
 gateway `ai.sufficit.com.br` (haproxy, HA entre eveo-ai/apoint-ai/castrum-ai)
 através de uma tailnet dedicada, sem expor nada na internet pública.
 
@@ -21,6 +21,18 @@ Implementado:
   (`LlamaServerManager`/`WhisperServerManager`, removidos). `tsgo` já é o
   processo que serve a API externa pela tailnet — um bind direto evita o
   spawn/HTTP-hop redundante de um processo filho.
+- ✅ **Embeddings OpenAI com lote, `usage` e `dimensions` seguro** —
+  `POST /v1/embeddings` aceita texto ou lote de textos, informa tokens e aplica
+  redução/renormalização L2 somente quando o catálogo declara que o modelo foi
+  treinado com Matryoshka Representation Learning. Qwen3-Embedding-0.6B aceita
+  `32..1024`; gte-Qwen2 preserva 1536 e recusa redução em vez de degradar o
+  vetor silenciosamente. `encoding_format` aceita apenas `float`.
+- ✅ **Descoberta executável** — `GET /v1/models` anuncia somente o modelo
+  residente (`ready` ou `busy`), nunca todos os arquivos baixados. Toda
+  inferência valida `model` e recusa uma seleção diferente do engine ativo.
+- ✅ **Estados e concorrência explícitos** — `/health` expõe `idle`, `loading`,
+  `ready`, `busy` ou `failed`; uma segunda inferência recebe `429` com
+  `Retry-After` em vez de entrar numa fila sem limite ou parecer sem modelo.
 - ✅ **Model manager** (Fase 6) — busca no Hugging Face, download
   resumível, troca de modelo ativo, smoke-test, remoção (com confirmação).
 - ✅ **Heartbeat em foreground service com política de bateria**
@@ -63,6 +75,13 @@ Implementado:
   trava para sempre em qualquer request de inferência (confirmado: `/health`
   respondia normal, só a inferência nunca retornava). Corrigido com
   `flash_attn = false` em `transcription.go`'s `transcriptionContextParams`.
+- ✅ **Fix: troca de engine podia causar OOM** — o processo `:sync` agora
+  descarrega o engine oposto antes de carregar o novo. A ordem inversa chegou
+  a manter Whisper e gte-Qwen2 juntos (~1,7 GiB de RSS+swap) e foi confirmada
+  pelo `lmkd` matando o foreground service no Galaxy A51.
+- ✅ **Artefato nativo verificável** — CI executa testes Go com detector de
+  corrida e `go vet`; `tsgo.integrity` liga hashes dos fontes, AAR e source JAR,
+  bloqueando release com `tsgo.aar` antigo ou divergente.
 
 Pendente:
 
@@ -100,6 +119,11 @@ acontece dentro do próprio processo `:sync` — troca isolamento de crash de
 inferência por não ter mais o overhead de spawn/HTTP-hop de um processo
 filho (ver kdoc de `ModelRuntimeService`).
 
+No processo `:sync`, o receiver apenas copia o `Intent` e agenda a transição
+em `Dispatchers.IO`. Um mutex serializa cada status recebido antes de executar
+unload/load nativo; assim, broadcasts próximos não bloqueiam a main thread,
+não provocam ANR e não conseguem carregar dois engines simultaneamente.
+
 ## Build local
 
 Requisitos: JDK 17, Android SDK (API 35). NDK só é necessário se for
@@ -132,8 +156,9 @@ dia a dia — `tsgo.aar` já sai commitado com tudo linkado.
 - `scripts/build-tsgo-aar.sh` — roda os dois scripts acima automaticamente
   se `.llama-static`/`.whisper-static` ainda não existirem, depois
   `gomobile bind` de `android-tsgo/` pra gerar o `tsgo.aar` final. Rodar
-  isso depois de qualquer mudança em `tsgo.go`/`embedding.go`/
-  `transcription.go`.
+  isso depois de qualquer mudança no módulo `android-tsgo`. O script atualiza
+  `android/app/libs/tsgo.integrity`; CI e release executam
+  `scripts/check-tsgo-aar.sh` antes do Gradle.
 
 Todos os scripts esperam `ndk;27.2.12479018` instalado
 (`sdkmanager --install "ndk;27.2.12479018"`) — mesma versão usada nos
@@ -152,8 +177,10 @@ campo multipart `file` em contêiner **RIFF/WAVE**. O decoder nativo suporta:
 Entradas multicanal são reduzidas a mono e reamostradas linearmente para 16
 kHz. MP3, OGG, FLAC, M4A e áudio cru sem cabeçalho WAV **não** são aceitos por
 este adaptador. A inferência HTTP é síncrona e serializada; consumidores devem
-executá-la em uma fila de segundo plano, usar timeout compatível com o perfil e
-tratar HTTP 503 como engine carregando ou ocupado.
+executá-la em uma fila de segundo plano e usar timeout compatível com o perfil.
+`503` indica engine ausente, carregando ou com falha; `429` + `Retry-After`
+indica engine ocupado. Providers móveis do Sufficit AI usam timeout de 20
+minutos para acomodar Whisper CPU-only, com teto de 30 minutos no adaptador.
 
 ## Publicando na Play Store
 

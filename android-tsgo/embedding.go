@@ -56,9 +56,7 @@ import "C"
 
 import (
 	"fmt"
-	"math"
 	"runtime"
-	"strings"
 	"sync"
 	"unsafe"
 )
@@ -76,6 +74,21 @@ var (
 // start the new one" semantics, except swapping a loaded model in this process's memory is
 // just pointer teardown/rebuild, no OS process spawn/kill race to wait out.
 func loadEmbeddingModel(modelPath string) error {
+	embeddingEngine.beginLifecycle()
+	err := loadEmbeddingModelNative(modelPath)
+	if err != nil {
+		embeddingEngine.finishLifecycle("", 0, err)
+		return err
+	}
+	embeddingEngine.finishLifecycle(
+		embeddingModelIDFromPath(modelPath),
+		embeddingNativeDimensions(),
+		nil,
+	)
+	return nil
+}
+
+func loadEmbeddingModelNative(modelPath string) error {
 	embeddingMu.Lock()
 	defer embeddingMu.Unlock()
 
@@ -117,9 +130,11 @@ func loadEmbeddingModel(modelPath string) error {
 
 // unloadEmbeddingModel frees whatever's resident, if anything. Safe to call unconditionally.
 func unloadEmbeddingModel() {
+	embeddingEngine.beginLifecycle()
 	embeddingMu.Lock()
-	defer embeddingMu.Unlock()
 	unloadEmbeddingModelLocked()
+	embeddingMu.Unlock()
+	embeddingEngine.finishLifecycle("", 0, nil)
 }
 
 func unloadEmbeddingModelLocked() {
@@ -140,15 +155,16 @@ func unloadEmbeddingModelLocked() {
 // (multi-second, for a ~1GB model) load duration. A blocking Lock here would make the precheck
 // itself block for that whole load instead of answering "not ready yet" immediately.
 func isEmbeddingModelLoaded() bool {
-	if !embeddingMu.TryLock() {
-		return false
-	}
-	defer embeddingMu.Unlock()
-	return embeddingCtx != nil
+	state := embeddingEngine.snapshot().State
+	return state == engineReady || state == engineBusy
 }
 
 // embeddingDimensions returns the resident model's native embedding width, or 0 if none loaded.
 func embeddingDimensions() int {
+	return embeddingEngine.snapshot().Dimensions
+}
+
+func embeddingNativeDimensions() int {
 	embeddingMu.Lock()
 	defer embeddingMu.Unlock()
 	if embeddingModel == nil {
@@ -162,12 +178,12 @@ func embeddingDimensions() int {
 // contract) expects. Not safe to call concurrently with itself: a llama_context isn't
 // reentrant for decode, hence the mutex around the whole call, same "one consumer at a time"
 // assumption as the old --parallel 1 subprocess flag.
-func embed(text string) ([]float32, error) {
+func embedWithUsage(text string) (embeddingInferenceResult, error) {
 	embeddingMu.Lock()
 	defer embeddingMu.Unlock()
 
 	if embeddingCtx == nil || embeddingModel == nil {
-		return nil, fmt.Errorf("no embedding model loaded")
+		return embeddingInferenceResult{}, fmt.Errorf("no embedding model loaded")
 	}
 
 	vocab := C.llama_model_get_vocab(embeddingModel)
@@ -179,14 +195,14 @@ func embed(text string) ([]float32, error) {
 	// a fixed max and truncating long inputs silently.
 	nTokensNeeded := C.llama_tokenize(vocab, cText, C.int32_t(len(text)), nil, 0, C.bool(true), C.bool(false))
 	if nTokensNeeded >= 0 {
-		return nil, fmt.Errorf("unexpected tokenize result: empty input")
+		return embeddingInferenceResult{}, fmt.Errorf("unexpected tokenize result: empty input")
 	}
 	nTokensMax := -nTokensNeeded
 
 	tokens := make([]C.llama_token, nTokensMax)
 	nTokens := C.llama_tokenize(vocab, cText, C.int32_t(len(text)), &tokens[0], nTokensMax, C.bool(true), C.bool(false))
 	if nTokens < 0 {
-		return nil, fmt.Errorf("llama_tokenize failed: %d", nTokens)
+		return embeddingInferenceResult{}, fmt.Errorf("llama_tokenize failed: %d", nTokens)
 	}
 
 	// llama_memory_clear would be ideal between calls (matches the official embedding
@@ -195,12 +211,12 @@ func embed(text string) ([]float32, error) {
 	batch := C.llama_batch_get_one(&tokens[0], nTokens)
 	rc := C.llama_decode(embeddingCtx, batch)
 	if rc != 0 {
-		return nil, fmt.Errorf("llama_decode failed: %d", rc)
+		return embeddingInferenceResult{}, fmt.Errorf("llama_decode failed: %d", rc)
 	}
 
 	embdPtr := C.llama_get_embeddings_seq(embeddingCtx, 0)
 	if embdPtr == nil {
-		return nil, fmt.Errorf("llama_get_embeddings_seq returned nil")
+		return embeddingInferenceResult{}, fmt.Errorf("llama_get_embeddings_seq returned nil")
 	}
 
 	nEmbd := int(C.llama_model_n_embd(embeddingModel))
@@ -209,39 +225,17 @@ func embed(text string) ([]float32, error) {
 	out := make([]float32, nEmbd)
 	copy(out, raw)
 	l2Normalize(out)
-	return out, nil
+	return embeddingInferenceResult{Vector: out, Tokens: int(nTokens)}, nil
+}
+
+func embed(text string) ([]float32, error) {
+	result, err := embedWithUsage(text)
+	return result.Vector, err
 }
 
 // embeddingModelID mirrors LlamaServerManager.aliasFor(modelFile) exactly — the id embedding
 // responses report, and the same id embeddingModelEntry (tsgo.go) expects to dedupe against
 // for GET /v1/models. Empty string if nothing is loaded.
 func embeddingModelID() string {
-	embeddingMu.Lock()
-	path := embeddingModelPath
-	embeddingMu.Unlock()
-	if path == "" {
-		return ""
-	}
-	base := path
-	if i := strings.LastIndexByte(base, '/'); i >= 0 {
-		base = base[i+1:]
-	}
-	if i := strings.LastIndexByte(base, '.'); i >= 0 {
-		base = base[:i]
-	}
-	return strings.ToLower(base) + "-embedding"
-}
-
-func l2Normalize(v []float32) {
-	var sumSq float64
-	for _, x := range v {
-		sumSq += float64(x) * float64(x)
-	}
-	if sumSq == 0 {
-		return
-	}
-	norm := float32(math.Sqrt(sumSq))
-	for i := range v {
-		v[i] /= norm
-	}
+	return embeddingEngine.snapshot().Model
 }

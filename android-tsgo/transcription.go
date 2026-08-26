@@ -70,6 +70,17 @@ var (
 // loadTranscriptionModel loads modelPath as the resident transcription model, unloading
 // whatever was previously loaded first — mirrors loadEmbeddingModel's swap semantics.
 func loadTranscriptionModel(modelPath string) error {
+	transcriptionEngine.beginLifecycle()
+	err := loadTranscriptionModelNative(modelPath)
+	if err != nil {
+		transcriptionEngine.finishLifecycle("", 0, err)
+		return err
+	}
+	transcriptionEngine.finishLifecycle(transcriptionModelIDFromPath(modelPath), 0, nil)
+	return nil
+}
+
+func loadTranscriptionModelNative(modelPath string) error {
 	transcriptionMu.Lock()
 	defer transcriptionMu.Unlock()
 
@@ -95,9 +106,11 @@ func loadTranscriptionModel(modelPath string) error {
 
 // unloadTranscriptionModel frees whatever's resident, if anything. Safe to call unconditionally.
 func unloadTranscriptionModel() {
+	transcriptionEngine.beginLifecycle()
 	transcriptionMu.Lock()
-	defer transcriptionMu.Unlock()
 	unloadTranscriptionModelLocked()
+	transcriptionMu.Unlock()
+	transcriptionEngine.finishLifecycle("", 0, nil)
 }
 
 func unloadTranscriptionModelLocked() {
@@ -119,11 +132,8 @@ func unloadTranscriptionModelLocked() {
 // flight) reports "not loaded" — correct for the former, an acceptable narrow race for the
 // latter (mutual exclusion already limits this app to one inference at a time anyway).
 func isTranscriptionModelLoaded() bool {
-	if !transcriptionMu.TryLock() {
-		return false
-	}
-	defer transcriptionMu.Unlock()
-	return transcriptionCtx != nil
+	state := transcriptionEngine.snapshot().State
+	return state == engineReady || state == engineBusy
 }
 
 // transcribe runs pcm (mono float32 @ 16kHz — see decodeWAVToPCM16kMono) through the resident

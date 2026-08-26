@@ -365,9 +365,12 @@ private fun SufficitApp(store: PairingStore, oauth: OAuthManager, startDestinati
                     store.pairingToken = token
                     pairingLoading = true
                     pairingStatus = null
-                    SyncForegroundService.start(context)
                     awaitingPairingValidation = true
-                    SyncForegroundService.syncNow(context)
+                    // :sync is a separate process and an already-running SharedPreferences
+                    // instance does not reliably observe writes made here. Carry the one-time
+                    // pairing credential in this explicit, non-exported service command so the
+                    // validation never depends on cross-process preference invalidation.
+                    SyncForegroundService.syncNow(context, token)
                 }
             )
         }

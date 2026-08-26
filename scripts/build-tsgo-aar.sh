@@ -44,4 +44,5 @@ export ANDROID_NDK_HOME
 # O AAR contém apenas inferência e o listener HTTP. WireGuard/Headscale pertencem ao
 # sufficit-mobile-vpn, portanto não há build tag nem dependência Tailscale neste módulo.
 gomobile bind -target=android/arm64 -androidapi 28 -o "$OUT" .
+"$REPO_ROOT/scripts/check-tsgo-aar.sh" --write
 echo "Wrote $OUT"

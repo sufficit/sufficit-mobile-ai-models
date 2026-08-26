@@ -6,6 +6,10 @@ data class KnownGoodModel(
     val downloadUrl: String,
     /** Null for kinds where it doesn't apply (e.g. [ModelKind.TRANSCRIPTION]). */
     val dimensions: Int?,
+    /** Whether the model was trained for safe Matryoshka output truncation. */
+    val supportsDimensions: Boolean = false,
+    /** Smallest useful output accepted when [supportsDimensions] is true. */
+    val minDimensions: Int? = null,
     val sizeGB: Double,
     val kind: ModelKind,
     /** Device-specific guidance shown below the size. Null for models without a benchmark. */
@@ -40,6 +44,8 @@ object DeviceModelCatalog {
             fileName = "Qwen3-Embedding-0.6B-Q8_0.gguf",
             downloadUrl = "https://huggingface.co/Qwen/Qwen3-Embedding-0.6B-GGUF/resolve/main/Qwen3-Embedding-0.6B-Q8_0.gguf",
             dimensions = 1024,
+            supportsDimensions = true,
+            minDimensions = 32,
             sizeGB = 0.64,
             kind = ModelKind.EMBEDDING
         ),

@@ -1,34 +1,23 @@
 package tsgo
 
-// POST /v1/audio/transcriptions and /v1/audio/translations handlers — portable (no build tag):
-// calls the platform-specific transcribe()/isTranscriptionModelLoaded() (real cgo/whisper.cpp
-// implementation in transcription.go under "android", stub in transcription_stub.go otherwise),
-// same split as embedding_http.go. Replaces newWhisperReverseProxy/newWhisperTranslateReverseProxy
-// (reverse-proxying to a spawned whisper-server subprocess, both removed) — response shape
-// (task/language/duration/text/segments plus the sufficit-services-whisper compatibility fields
-// model/server/device/cached/processing_time) matches what those used to produce, so no client
-// of this endpoint needs to change.
-
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
 	"time"
 )
 
-// maxTranscriptionBodyBytes bounds multipart form parsing — generous for a voice note/short
-// recording while still bounding worst-case memory use (matches the old translate-rewrite
-// proxy's own cap).
-const maxTranscriptionBodyBytes = 64 << 20 // 64MB
+const (
+	maxTranscriptionBodyBytes = 64 << 20 // 64 MiB audio payload
+	maxMultipartOverheadBytes = 1 << 20  // multipart fields and headers
+)
 
-// transcriptionSegment/transcriptionResult are shared between transcription.go (android, real
-// cgo/whisper.cpp implementation) and transcription_stub.go (!android) — declared here, in the
-// portable file, rather than duplicated in both build-tagged files.
 type transcriptionSegment struct {
 	Text  string
-	Start float64 // seconds
-	End   float64 // seconds
+	Start float64
+	End   float64
 }
 
 type transcriptionResult struct {
@@ -37,113 +26,146 @@ type transcriptionResult struct {
 	Segments []transcriptionSegment
 }
 
+type audioHTTPRuntime struct {
+	snapshot   func() engineSnapshot
+	tryBegin   func() (engineSnapshot, bool)
+	finish     func(error)
+	transcribe func([]float32, bool, string) (transcriptionResult, error)
+}
+
 func newTranscriptionsHandler() http.Handler { return newAudioHandler(false) }
 
-// newTranslationsHandler forces translate=true regardless of what the caller sends — whisper.cpp
-// only supports translation via a per-request field on its transcription endpoint, not a
-// separate URL, so this just pins that field the way newWhisperTranslateReverseProxy's request
-// rewrite used to.
 func newTranslationsHandler() http.Handler { return newAudioHandler(true) }
 
 func newAudioHandler(forceTranslate bool) http.Handler {
+	return newAudioHandlerWithRuntime(forceTranslate, audioHTTPRuntime{
+		snapshot:   transcriptionEngine.snapshot,
+		tryBegin:   transcriptionEngine.tryBeginInference,
+		finish:     transcriptionEngine.finishInference,
+		transcribe: transcribe,
+	})
+}
+
+func newAudioHandlerWithRuntime(forceTranslate bool, runtime audioHTTPRuntime) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 
-		if !isTranscriptionModelLoaded() {
-			log.Printf("[tsgo] POST %s: no transcription model loaded", r.URL.Path)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write([]byte(noModelBody))
+		snapshot := runtime.snapshot()
+		if snapshot.State != engineReady {
+			writeEngineStateResponse(w, snapshot)
 			return
 		}
 
-		if err := r.ParseMultipartForm(maxTranscriptionBodyBytes); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"failed to parse multipart form"}`))
+		r.Body = http.MaxBytesReader(w, r.Body, maxTranscriptionBodyBytes+maxMultipartOverheadBytes)
+		if err := r.ParseMultipartForm(8 << 20); err != nil {
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				writeJSONError(w, http.StatusRequestEntityTooLarge, "request_too_large", "audio request exceeds 65 MiB")
+				return
+			}
+			writeJSONError(w, http.StatusBadRequest, "invalid_multipart", "failed to parse multipart form")
+			return
+		}
+		if r.MultipartForm != nil {
+			defer r.MultipartForm.RemoveAll()
+		}
+
+		requestedModel := r.FormValue("model")
+		if !modelMatches(requestedModel, snapshot.Model) {
+			writeJSONError(w, http.StatusConflict, "model_not_loaded",
+				"the requested transcription model is not the active model")
 			return
 		}
 
 		fileHeaders := r.MultipartForm.File["file"]
 		if len(fileHeaders) != 1 {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"missing \"file\" part"}`))
+			writeJSONError(w, http.StatusBadRequest, "invalid_file", "exactly one file part is required")
 			return
 		}
-		f, err := fileHeaders[0].Open()
-		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+		if fileHeaders[0].Size > maxTranscriptionBodyBytes {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request_too_large", "audio file exceeds 64 MiB")
 			return
 		}
-		audioBytes, err := io.ReadAll(f)
-		f.Close()
+
+		file, err := fileHeaders[0].Open()
 		if err != nil {
-			w.WriteHeader(http.StatusBadRequest)
+			writeJSONError(w, http.StatusBadRequest, "invalid_file", "failed to open audio file")
+			return
+		}
+		audioBytes, err := io.ReadAll(io.LimitReader(file, maxTranscriptionBodyBytes+1))
+		_ = file.Close()
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid_file", "failed to read audio file")
+			return
+		}
+		if len(audioBytes) > maxTranscriptionBodyBytes {
+			writeJSONError(w, http.StatusRequestEntityTooLarge, "request_too_large", "audio file exceeds 64 MiB")
 			return
 		}
 
 		pcm, err := decodeWAVToPCM16kMono(audioBytes)
 		if err != nil {
 			log.Printf("[tsgo] POST %s: WAV decode failed: %v", r.URL.Path, err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusBadRequest)
-			_, _ = w.Write([]byte(`{"error":"unsupported or invalid audio (WAV only)"}`))
+			writeJSONError(w, http.StatusBadRequest, "unsupported_audio", "unsupported or invalid audio (WAV only)")
+			return
+		}
+
+		admitted, ok := runtime.tryBegin()
+		if !ok {
+			writeEngineStateResponse(w, admitted)
+			return
+		}
+		var inferenceErr error
+		defer func() { runtime.finish(inferenceErr) }()
+		if !modelMatches(requestedModel, admitted.Model) {
+			writeJSONError(w, http.StatusConflict, "model_not_loaded",
+				"the requested transcription model is not the active model")
 			return
 		}
 
 		translate := forceTranslate || r.FormValue("translate") == "true"
-
 		start := time.Now()
-		result, err := transcribe(pcm, translate, r.FormValue("language"))
-		if err != nil {
-			log.Printf("[tsgo] POST %s: transcribe failed: %v", r.URL.Path, err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_, _ = w.Write([]byte(`{"error":"transcription inference failed"}`))
+		result, inferenceErr := runtime.transcribe(pcm, translate, r.FormValue("language"))
+		if inferenceErr != nil {
+			log.Printf("[tsgo] POST %s: transcribe failed: %v", r.URL.Path, inferenceErr)
+			writeJSONError(w, http.StatusInternalServerError, "inference_failed", "transcription inference failed")
 			return
 		}
 
-		respLanguage := result.Language
+		responseLanguage := result.Language
 		task := "transcribe"
 		if forceTranslate {
-			// sufficit-services-whisper always reports the OUTPUT language here (translation
-			// output is always English) — same override the old translate proxy applied.
-			respLanguage = "english"
+			responseLanguage = "english"
 			task = "translate"
 		}
 
 		segments := make([]map[string]any, len(result.Segments))
-		for i, s := range result.Segments {
-			segments[i] = map[string]any{"text": s.Text, "start": s.Start, "end": s.End}
+		for index, segment := range result.Segments {
+			segments[index] = map[string]any{
+				"text": segment.Text, "start": segment.Start, "end": segment.End,
+			}
 		}
 
 		transcriptionMetaMu.RLock()
-		modelName := activeModelName
 		hostname := deviceHostname
 		transcriptionMetaMu.RUnlock()
 
-		out, err := json.Marshal(map[string]any{
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(map[string]any{
 			"task":            task,
-			"language":        respLanguage,
+			"language":        responseLanguage,
 			"duration":        float64(len(pcm)) / whisperSampleRate,
 			"text":            result.Text,
 			"segments":        segments,
-			"model":           modelName,
+			"model":           admitted.Model,
 			"server":          hostname,
 			"device":          "cpu",
 			"cached":          false,
 			"processing_time": time.Since(start).Seconds(),
 		})
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(out)
 	})
 }
