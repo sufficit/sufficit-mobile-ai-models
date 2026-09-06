@@ -1,3 +1,5 @@
 node_modules/
 .env
 *.log
+# Worktrees (padrao): arvores de trabalho em <repo>/.worktrees/
+**/.worktrees/
