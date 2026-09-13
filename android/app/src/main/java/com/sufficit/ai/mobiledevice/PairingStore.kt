@@ -2,6 +2,7 @@ package com.sufficit.ai.mobiledevice
 
 import android.content.Context
 import android.content.SharedPreferences
+import android.provider.Settings
 import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKey
 import java.util.UUID
@@ -22,6 +23,9 @@ import java.util.UUID
  * deployed yet, device unreachable) must never throw away a valid login.
  */
 class PairingStore(context: Context) {
+
+    // Application context only — safe to hold for the store's lifetime.
+    private val appContext: Context = context.applicationContext
 
     private val prefs: SharedPreferences = run {
         val masterKey = MasterKey.Builder(context)
@@ -67,10 +71,23 @@ class PairingStore(context: Context) {
         get() = prefs.getString(KEY_AVATAR_URL, null)
         set(value) = prefs.edit().putString(KEY_AVATAR_URL, value).apply()
 
-    /** Stable, non-secret per-install id. Generated once, reused for every self-announce call. */
+    /**
+     * Stable, non-secret per-device id, reused for every announce call (both pairing
+     * modes). Rooted in ANDROID_ID so it survives reinstalls and app-data clears —
+     * a fresh UUID per install made every re-pair stack a duplicate provider on the
+     * server (found live: five "Lenovo Tab P11 Pro" providers for one tablet).
+     * ANDROID_ID is also per-user-profile, which keeps multi-user tablets distinct.
+     * Legacy installs keep their previously stored id to stay matched to server records.
+     */
     val deviceInstanceId: String
-        get() = prefs.getString(KEY_DEVICE_INSTANCE_ID, null) ?: UUID.randomUUID().toString().also {
-            prefs.edit().putString(KEY_DEVICE_INSTANCE_ID, it).apply()
+        get() = prefs.getString(KEY_DEVICE_INSTANCE_ID, null) ?: run {
+            val androidId = Settings.Secure.getString(
+                appContext.contentResolver,
+                Settings.Secure.ANDROID_ID
+            )
+            val id = if (!androidId.isNullOrBlank()) "android-$androidId" else UUID.randomUUID().toString()
+            prefs.edit().putString(KEY_DEVICE_INSTANCE_ID, id).apply()
+            id
         }
 
     /** Tailnet login-server URL, cached from the last successful announce ([TailscaleManager]). */

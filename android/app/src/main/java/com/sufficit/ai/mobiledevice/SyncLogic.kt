@@ -45,6 +45,7 @@ suspend fun performSync(
         pairingToken != null -> api.announce(
             gatewayBaseUrl = Config.DEFAULT_GATEWAY_URL,
             token = pairingToken,
+            deviceInstanceId = store.deviceInstanceId,
             deviceName = deviceName,
             deviceModel = deviceModel,
             appVersion = appVersion

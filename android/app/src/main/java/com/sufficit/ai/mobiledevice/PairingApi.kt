@@ -91,11 +91,16 @@ class PairingApi(
     fun announce(
         gatewayBaseUrl: String,
         token: String,
+        deviceInstanceId: String,
         deviceName: String,
         deviceModel: String,
         appVersion: String
     ): AnnounceResult {
-        val body = announceBody(deviceName, deviceModel, appVersion)
+        val body = announceBody(deviceName, deviceModel, appVersion) {
+            // Same stable identity as self-announce — lets the backend adopt the existing
+            // provider instead of creating a duplicate row when the pairing token rotates.
+            put("deviceInstanceId", deviceInstanceId)
+        }
         val url = gatewayBaseUrl.trimEnd('/') + "/api/ai/mobile-devices/pairing/announce"
         val request = Request.Builder()
             .url(url)

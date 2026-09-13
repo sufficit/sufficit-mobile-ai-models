@@ -39,6 +39,7 @@ class PairingApiTest {
         val result = api.announce(
             gatewayBaseUrl = server.url("/").toString(),
             token = "tok",
+            deviceInstanceId = "instance-1",
             deviceName = "dev",
             deviceModel = "Samsung SM-A515F",
             appVersion = "0.4.1 (5)"
@@ -54,6 +55,7 @@ class PairingApiTest {
         val request = server.takeRequest()
         val payload = JSONObject(request.body.readUtf8())
         assertEquals("dev", payload.getString("deviceName"))
+        assertEquals("instance-1", payload.getString("deviceInstanceId"))
         assertEquals("Samsung SM-A515F", payload.getString("deviceModel"))
         assertEquals("0.4.1 (5)", payload.getString("appVersion"))
         assertEquals("com.sufficit.ai.mobiledevice", payload.getString("applicationId"))
@@ -70,6 +72,7 @@ class PairingApiTest {
         val result = api.announce(
             gatewayBaseUrl = server.url("/").toString(),
             token = "tok",
+            deviceInstanceId = "instance-1",
             deviceName = "dev",
             deviceModel = "Samsung SM-A515F",
             appVersion = "0.4.1 (5)"
@@ -86,6 +89,7 @@ class PairingApiTest {
         val result = api.announce(
             gatewayBaseUrl = server.url("/").toString(),
             token = "tok",
+            deviceInstanceId = "instance-1",
             deviceName = "dev",
             deviceModel = "Samsung SM-A515F",
             appVersion = "0.4.1 (5)"
@@ -102,6 +106,7 @@ class PairingApiTest {
         val result = api.announce(
             gatewayBaseUrl = server.url("/").toString(),
             token = "tok",
+            deviceInstanceId = "instance-1",
             deviceName = "dev",
             deviceModel = "Samsung SM-A515F",
             appVersion = "0.4.1 (5)"
@@ -119,6 +124,7 @@ class PairingApiTest {
         val result = api.announce(
             gatewayBaseUrl = deadUrl,
             token = "tok",
+            deviceInstanceId = "instance-1",
             deviceName = "dev",
             deviceModel = "Samsung SM-A515F",
             appVersion = "0.4.1 (5)"
