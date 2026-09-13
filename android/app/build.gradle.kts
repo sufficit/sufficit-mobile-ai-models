@@ -23,8 +23,8 @@ android {
         applicationId = "com.sufficit.ai.mobiledevice"
         minSdk = 28
         targetSdk = 35
-        versionCode = 12
-        versionName = "0.5.3"
+        versionCode = 13
+        versionName = "0.6.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
