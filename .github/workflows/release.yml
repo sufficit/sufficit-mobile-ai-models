@@ -22,6 +22,9 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # idem ci.yml: default 'tools platform-tools' quebra no cmdline-tools 16.0
+          packages: platform-tools
 
       - name: Verify committed native runtime
         run: ./scripts/check-tsgo-aar.sh

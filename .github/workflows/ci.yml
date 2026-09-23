@@ -29,6 +29,10 @@ jobs:
           distribution: temurin
           java-version: "17"
       - uses: android-actions/setup-android@v3
+        with:
+          # default da action inclui o pacote legado 'tools', que o cmdline-tools
+          # 16.0 nao resolve mais ("Failed to find package 'tools'") — 23/09.
+          packages: platform-tools
       - run: ./scripts/check-tsgo-aar.sh
       - run: cd android && ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest
   proxy:
