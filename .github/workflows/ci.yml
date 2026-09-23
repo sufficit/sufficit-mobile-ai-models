@@ -19,18 +19,16 @@ jobs:
       - run: cd android-tsgo && go test -race ./...
       - run: cd android-tsgo && go vet ./...
   android:
-    runs-on: android-builder
-    timeout-minutes: 30
-    concurrency:
-      group: ci-android-${{ github.ref }}
-      cancel-in-progress: true
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           lfs: true
-      # JDK 17 + cmdline-tools/platform-35/build-tools 35.0.0 vêm na imagem do
-      # runner (sufficit-ci/docker/runner-android-builder.Dockerfile) — os steps
-      # de setup-java/setup-android foram removidos na migração do pool.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: android-actions/setup-android@v3
       - run: ./scripts/check-tsgo-aar.sh
       - run: cd android && ./gradlew --no-daemon :app:assembleDebug :app:testDebugUnitTest
   proxy:
